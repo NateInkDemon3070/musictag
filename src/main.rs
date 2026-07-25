@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crossterm::{
@@ -9,6 +10,7 @@ use crossterm::{
 use lofty::{
     config::{ParseOptions, WriteOptions},
     file::{BoundTaggedFile, TaggedFileExt},
+    picture::{Picture, PictureType},
     read_from_path,
     tag::ItemKey,
 };
@@ -34,27 +36,56 @@ fn config_path() -> PathBuf {
         .join("config")
 }
 
-fn load_config() -> Option<PathBuf> {
+fn load_config() -> (Option<PathBuf>, bool) {
     let path = config_path();
-    let content = fs::read_to_string(&path).ok()?;
-    let dir = content.trim().to_string();
-    if dir.is_empty() {
-        return None;
+    let content = match fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => return (None, true),
+    };
+
+    let mut dir: Option<PathBuf> = None;
+    let mut show_preview = true;
+
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some((key, value)) = line.split_once('=') {
+            match key.trim() {
+                "default_dir" => {
+                    let p = PathBuf::from(value.trim());
+                    if p.exists() && p.is_dir() {
+                        dir = Some(p);
+                    }
+                }
+                "show_preview" => {
+                    show_preview = value.trim() != "false";
+                }
+                _ => {}
+            }
+        } else if dir.is_none() {
+            let p = PathBuf::from(line);
+            if p.exists() && p.is_dir() {
+                dir = Some(p);
+            }
+        }
     }
-    let p = PathBuf::from(&dir);
-    if p.exists() && p.is_dir() {
-        Some(p)
-    } else {
-        None
-    }
+
+    (dir, show_preview)
 }
 
-fn save_config(dir: &Path) -> Result<(), String> {
+fn save_config(dir: &Path, show_preview: bool) -> Result<(), String> {
     let path = config_path();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("Could not create config dir: {}", e))?;
     }
-    fs::write(&path, dir.to_string_lossy().as_bytes())
+    let content = format!(
+        "default_dir={}\nshow_preview={}\n",
+        dir.display(),
+        show_preview
+    );
+    fs::write(&path, content.as_bytes())
         .map_err(|e| format!("Could not save config: {}", e))?;
     Ok(())
 }
@@ -78,6 +109,7 @@ mod icon {
     pub const WARNING: &str = "\u{f071}";
     pub const BULK: &str = "\u{f0c3}";
     pub const GLOBE: &str = "\u{f0ac}";
+    pub const IMAGE: &str = "\u{f03e}";
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -90,6 +122,7 @@ struct L {
     lang: Lang,
 }
 
+#[allow(dead_code)]
 impl L {
     fn detect() -> Self {
         let locale = std::env::var("LANG")
@@ -191,11 +224,11 @@ impl L {
     fn help_browse(&self) -> String {
         match self.lang {
             Lang::Es => format!(
-                "{}{} mover  {} abrir  {} seleccionar  {} seleccionar todo  {} editar seleccion  {} eliminar  C:predeterminada  {} salir",
+                "{}{} mover  {} abrir  {} seleccionar  {} seleccionar todo  {} editar seleccion  {} eliminar  c:portada  P:preview  C:predeterminada  {} salir",
                 icon::ARROW_UP, icon::ARROW_DOWN, icon::ARROW_RIGHT, icon::SELECT, icon::BULK, icon::EDIT, icon::TRASH, icon::CLOSE,
             ),
             Lang::En => format!(
-                "{}{} move  {} open  {} select  {} select all  {} edit selected  {} delete  C:default  {} quit",
+                "{}{} move  {} open  {} select  {} select all  {} edit selected  {} delete  c:cover  P:preview  C:default  {} quit",
                 icon::ARROW_UP, icon::ARROW_DOWN, icon::ARROW_RIGHT, icon::SELECT, icon::BULK, icon::EDIT, icon::TRASH, icon::CLOSE,
             ),
         }
@@ -421,6 +454,34 @@ impl L {
             ),
         }
     }
+
+    fn cover_title(&self) -> String {
+        match self.lang {
+            Lang::Es => format!(" {} Asignar portada ", icon::IMAGE),
+            Lang::En => format!(" {} Set cover art ", icon::IMAGE),
+        }
+    }
+
+    fn cover_hint(&self) -> &str {
+        match self.lang {
+            Lang::Es => "  Enter:aplicar  Esc:cancelar  ",
+            Lang::En => "  Enter:apply   Esc:cancel   ",
+        }
+    }
+
+    fn preview_enabled(&self) -> String {
+        match self.lang {
+            Lang::Es => format!("{} Preview de imagenes activado", icon::CHECK),
+            Lang::En => format!("{} Image preview enabled", icon::CHECK),
+        }
+    }
+
+    fn preview_disabled(&self) -> String {
+        match self.lang {
+            Lang::Es => format!("{} Preview de imagenes desactivado", icon::CHECK),
+            Lang::En => format!("{} Image preview disabled", icon::CHECK),
+        }
+    }
 }
 
 fn field_key(key: &str) -> ItemKey {
@@ -444,6 +505,7 @@ enum AppMode {
     Edit,
     Filter,
     DeleteConfirm,
+    SetCoverArt,
 }
 
 struct App {
@@ -462,6 +524,10 @@ struct App {
     filter_text: String,
     filter_cursor: usize,
     delete_indices: Vec<usize>,
+    cover_path: String,
+    cover_cursor: usize,
+    show_preview: bool,
+    preview_img_area: Option<Rect>,
     status_msg: String,
     status_is_error: bool,
     should_quit: bool,
@@ -469,7 +535,7 @@ struct App {
 }
 
 impl App {
-    fn new(start_dir: PathBuf, l: L) -> Self {
+    fn new(start_dir: PathBuf, l: L, show_preview: bool) -> Self {
         let mut app = App {
             current_dir: start_dir,
             dir_entries: Vec::new(),
@@ -486,6 +552,10 @@ impl App {
             filter_text: String::new(),
             filter_cursor: 0,
             delete_indices: Vec::new(),
+            cover_path: String::new(),
+            cover_cursor: 0,
+            show_preview,
+            preview_img_area: None,
             status_msg: String::new(),
             status_is_error: false,
             should_quit: false,
@@ -769,12 +839,64 @@ impl App {
         self.mode = AppMode::DeleteConfirm;
     }
 
+    fn enter_set_cover_art(&mut self) {
+        if self.current_idx < self.dir_entries.len() {
+            return;
+        }
+        self.cover_path.clear();
+        self.cover_cursor = 0;
+        self.mode = AppMode::SetCoverArt;
+    }
+
+    fn apply_cover_art(&mut self) -> bool {
+        if self.current_idx < self.dir_entries.len() {
+            return false;
+        }
+        let fidx = self.current_idx - self.dir_entries.len();
+        if fidx >= self.files.len() {
+            return false;
+        }
+
+        let filepath = &self.files[fidx];
+        let img_path = Path::new(&self.cover_path);
+
+        if !img_path.exists() {
+            self.status_msg = match self.l.lang {
+                Lang::Es => format!("{} La imagen no existe", icon::CLOSE),
+                Lang::En => format!("{} Image does not exist", icon::CLOSE),
+            };
+            self.status_is_error = true;
+            return false;
+        }
+
+        match set_cover_art(filepath, img_path) {
+            Ok(()) => {
+                let name = filepath.file_name().unwrap_or_default().to_string_lossy();
+                self.status_msg = match self.l.lang {
+                    Lang::Es => format!("{} Portada asignada: {}", icon::CHECK, name),
+                    Lang::En => format!("{} Cover art set: {}", icon::CHECK, name),
+                };
+                self.status_is_error = false;
+                true
+            }
+            Err(e) => {
+                self.status_msg = match self.l.lang {
+                    Lang::Es => format!("{} Error al asignar portada: {}", icon::CLOSE, e),
+                    Lang::En => format!("{} Cover art error: {}", icon::CLOSE, e),
+                };
+                self.status_is_error = true;
+                false
+            }
+        }
+    }
+
     fn handle_key(&mut self, key: KeyEvent) {
         match self.mode {
             AppMode::Browse => self.handle_browse_key(key),
             AppMode::Edit => self.handle_edit_key(key),
             AppMode::Filter => self.handle_filter_key(key),
             AppMode::DeleteConfirm => self.handle_delete_confirm_key(key),
+            AppMode::SetCoverArt => self.handle_cover_art_key(key),
         }
     }
 
@@ -841,7 +963,7 @@ impl App {
                 self.enter_delete_confirm();
             }
             KeyCode::Char('C') => {
-                match save_config(&self.current_dir) {
+                match save_config(&self.current_dir, self.show_preview) {
                     Ok(()) => {
                         self.status_msg = self.l.config_saved();
                         self.status_is_error = false;
@@ -851,6 +973,18 @@ impl App {
                         self.status_is_error = true;
                     }
                 }
+            }
+            KeyCode::Char('c') => {
+                self.enter_set_cover_art();
+            }
+            KeyCode::Char('P') => {
+                self.show_preview = !self.show_preview;
+                self.status_msg = if self.show_preview {
+                    self.l.preview_enabled()
+                } else {
+                    self.l.preview_disabled()
+                };
+                self.status_is_error = false;
             }
             _ => {}
         }
@@ -1014,6 +1148,56 @@ impl App {
             _ => {}
         }
     }
+
+    fn handle_cover_art_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.mode = AppMode::Browse;
+                self.status_msg = self.l.cancelled();
+                self.status_is_error = false;
+            }
+            KeyCode::Enter => {
+                if self.cover_path.is_empty() {
+                    return;
+                }
+                if self.apply_cover_art() {
+                    self.mode = AppMode::Browse;
+                }
+            }
+            KeyCode::Char(c) => {
+                self.cover_path.insert(self.cover_cursor, c);
+                self.cover_cursor += 1;
+            }
+            KeyCode::Backspace => {
+                if self.cover_cursor > 0 {
+                    self.cover_cursor -= 1;
+                    self.cover_path.remove(self.cover_cursor);
+                }
+            }
+            KeyCode::Delete => {
+                if self.cover_cursor < self.cover_path.len() {
+                    self.cover_path.remove(self.cover_cursor);
+                }
+            }
+            KeyCode::Left => {
+                if self.cover_cursor > 0 {
+                    self.cover_cursor -= 1;
+                }
+            }
+            KeyCode::Right => {
+                if self.cover_cursor < self.cover_path.len() {
+                    self.cover_cursor += 1;
+                }
+            }
+            KeyCode::Home => {
+                self.cover_cursor = 0;
+            }
+            KeyCode::End => {
+                self.cover_cursor = self.cover_path.len();
+            }
+            _ => {}
+        }
+    }
 }
 
 fn read_metadata(filepath: &Path) -> Option<Vec<String>> {
@@ -1070,15 +1254,52 @@ fn write_metadata(filepath: &Path, vals: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn set_cover_art(filepath: &Path, image_path: &Path) -> Result<(), String> {
+    use std::fs::OpenOptions;
+
+    let img_data = std::fs::read(image_path)
+        .map_err(|e| format!("Could not read image: {}", e))?;
+
+    let picture = Picture::from_reader(&mut &img_data[..])
+        .map_err(|e| format!("Invalid image: {}", e))?;
+
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(filepath)
+        .map_err(|e| format!("Could not open: {}", e))?;
+
+    let mut bound = BoundTaggedFile::read_from(file, ParseOptions::new())
+        .map_err(|e| format!("Could not read: {}", e))?;
+
+    let tag = if bound.primary_tag_mut().is_some() {
+        bound.primary_tag_mut().unwrap()
+    } else if bound.first_tag_mut().is_some() {
+        bound.first_tag_mut().unwrap()
+    } else {
+        return Err("No tag found".to_string());
+    };
+
+    tag.remove_picture_type(PictureType::CoverFront);
+    tag.push_picture(picture);
+
+    bound
+        .save(WriteOptions::default())
+        .map_err(|e| format!("Could not save: {}", e))?;
+
+    Ok(())
+}
+
 fn ui(frame: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Min(5),
-            Constraint::Length(1),
-            Constraint::Length(1),
+            Constraint::Length(1), // header
+            Constraint::Length(1), // help bar
+            Constraint::Length(1), // dir path / title
+            Constraint::Min(5),   // content area
+            Constraint::Length(1), // status
+            Constraint::Length(1), // message
         ])
         .split(frame.area());
 
@@ -1102,6 +1323,10 @@ fn ui(frame: &mut Frame, app: &App) {
             render_browse(frame, app, &chunks);
             render_delete_confirm(frame, app);
         }
+        AppMode::SetCoverArt => {
+            render_browse(frame, app, &chunks);
+            render_cover_art_popup(frame, app);
+        }
     }
 }
 
@@ -1111,15 +1336,29 @@ fn render_browse(frame: &mut Frame, app: &App, chunks: &[Rect]) {
         .add_modifier(Modifier::BOLD);
     let dir_text = format!(" {} {}", icon::FOLDER, app.current_dir.display());
     let dir_para = Paragraph::new(dir_text).style(dir_style);
-    frame.render_widget(dir_para, chunks[1]);
+    frame.render_widget(dir_para, chunks[2]);
 
     let help_para = Paragraph::new(app.l.help_browse())
         .style(Style::default().fg(Color::Yellow))
         .alignment(ratatui::layout::Alignment::Center);
-    frame.render_widget(help_para, chunks[2]);
+    frame.render_widget(help_para, chunks[1]);
+
+    let (list_area, preview_area) = if app.show_preview {
+        let content_chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(60),
+                Constraint::Percentage(40),
+            ])
+            .split(chunks[3]);
+        let cc: Vec<Rect> = content_chunks.iter().copied().collect();
+        (cc[0], Some(cc[1]))
+    } else {
+        (chunks[3], None)
+    };
 
     let total = app.total_items();
-    let list_height = chunks[2].height as usize;
+    let list_height = list_area.height as usize;
 
     let mut adjusted_scroll = app.scroll_offset;
     if app.current_idx >= adjusted_scroll + list_height {
@@ -1176,7 +1415,11 @@ fn render_browse(frame: &mut Frame, app: &App, chunks: &[Rect]) {
                 .add_modifier(Modifier::BOLD),
         );
 
-    frame.render_stateful_widget(list, chunks[2], &mut state);
+    frame.render_stateful_widget(list, list_area, &mut state);
+
+    if let Some(area) = preview_area {
+        render_preview(frame, app, area);
+    }
 
     let mut info = app.l.info_files(app.current_idx + 1, total, app.files.len());
     if !app.filter_text.is_empty() {
@@ -1192,7 +1435,7 @@ fn render_browse(frame: &mut Frame, app: &App, chunks: &[Rect]) {
     let info_para = Paragraph::new(info)
         .style(info_style)
         .alignment(ratatui::layout::Alignment::Center);
-    frame.render_widget(info_para, chunks[3]);
+    frame.render_widget(info_para, chunks[4]);
 
     if !app.status_msg.is_empty() {
         let status_style = if app.status_is_error {
@@ -1207,7 +1450,7 @@ fn render_browse(frame: &mut Frame, app: &App, chunks: &[Rect]) {
         let status_para = Paragraph::new(app.status_msg.clone())
             .style(status_style)
             .alignment(ratatui::layout::Alignment::Center);
-        frame.render_widget(status_para, chunks[4]);
+        frame.render_widget(status_para, chunks[5]);
     }
 }
 
@@ -1232,17 +1475,12 @@ fn render_edit(frame: &mut Frame, app: &App, chunks: &[Rect]) {
         })
         .add_modifier(Modifier::BOLD);
     let title = Paragraph::new(title_text).style(title_style);
-    frame.render_widget(title, chunks[1]);
+    frame.render_widget(title, chunks[2]);
 
     let help_para = Paragraph::new(app.l.help_edit())
         .style(Style::default().fg(Color::Yellow))
         .alignment(ratatui::layout::Alignment::Center);
-    frame.render_widget(help_para, chunks[2]);
-
-    let form_chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(100)])
-        .split(chunks[2]);
+    frame.render_widget(help_para, chunks[1]);
 
     let fields = app.get_fields();
     let mut lines: Vec<Line> = Vec::new();
@@ -1258,7 +1496,7 @@ fn render_edit(frame: &mut Frame, app: &App, chunks: &[Rect]) {
         };
 
         let label_span = Span::styled(
-            format!("  {} {:<16}", arrow, label),
+            format!("  {} {:<22}", arrow, label),
             if is_active {
                 Style::default()
                     .fg(Color::Black)
@@ -1296,7 +1534,7 @@ fn render_edit(frame: &mut Frame, app: &App, chunks: &[Rect]) {
     }
 
     let form_widget = Paragraph::new(lines).wrap(Wrap { trim: false });
-    frame.render_widget(form_widget, form_chunks[0]);
+    frame.render_widget(form_widget, chunks[3]);
 
     let status_style = Style::default()
         .fg(Color::Yellow)
@@ -1308,7 +1546,7 @@ fn render_edit(frame: &mut Frame, app: &App, chunks: &[Rect]) {
     ))
     .style(status_style)
     .alignment(ratatui::layout::Alignment::Center);
-    frame.render_widget(status, chunks[3]);
+    frame.render_widget(status, chunks[4]);
 
     if !app.status_msg.is_empty() {
         let status_style = if app.status_is_error {
@@ -1323,8 +1561,212 @@ fn render_edit(frame: &mut Frame, app: &App, chunks: &[Rect]) {
         let status_para = Paragraph::new(app.status_msg.clone())
             .style(status_style)
             .alignment(ratatui::layout::Alignment::Center);
-        frame.render_widget(status_para, chunks[4]);
+        frame.render_widget(status_para, chunks[5]);
     }
+}
+
+
+fn render_preview(frame: &mut Frame, app: &App, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .title(" Preview ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if inner.height < 2 || inner.width < 4 {
+        return;
+    }
+
+    if app.current_idx < app.dir_entries.len() {
+        let dir_name = app.dir_entries[app.current_idx]
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy();
+        let text = format!("{}\n{}", icon::FOLDER, dir_name);
+        let para = Paragraph::new(text)
+            .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+        frame.render_widget(para, inner);
+        return;
+    }
+
+    let fidx = app.current_idx - app.dir_entries.len();
+    if fidx >= app.files.len() {
+        return;
+    }
+
+    let filepath = &app.files[fidx];
+    let filename = filepath
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+
+    let ext = filepath
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_uppercase();
+
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(Span::styled(
+        format!("{} {}", icon::MUSIC_FILE, filename),
+        Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(Span::styled(
+        format!("  {}", ext),
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    if let Ok(meta) = std::fs::metadata(filepath) {
+        let size = if meta.len() >= 1_048_576 {
+            format!("{:.1} MB", meta.len() as f64 / 1_048_576.0)
+        } else if meta.len() >= 1024 {
+            format!("{:.1} KB", meta.len() as f64 / 1024.0)
+        } else {
+            format!("{} B", meta.len())
+        };
+        lines.push(Line::from(Span::styled(
+            format!("  {}", size),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
+    if let Ok(tagged_file) = read_from_path(filepath) {
+        if let Some(tag) = tagged_file
+            .primary_tag()
+            .or_else(|| tagged_file.first_tag())
+        {
+            lines.push(Line::from(""));
+
+            let fields = [
+                (ItemKey::TrackTitle, app.l.field_title()),
+                (ItemKey::TrackArtist, app.l.field_artist()),
+                (ItemKey::AlbumTitle, app.l.field_album()),
+                (ItemKey::RecordingDate, app.l.field_year()),
+                (ItemKey::Genre, app.l.field_genre()),
+                (ItemKey::TrackNumber, app.l.field_track()),
+            ];
+
+            for (key, label) in fields.iter() {
+                if let Some(val) = tag.get_string(key) {
+                    if !val.is_empty() {
+                        lines.push(Line::from(vec![
+                            Span::styled(
+                                format!("  {}: ", label),
+                                Style::default()
+                                    .fg(Color::Magenta)
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                            Span::styled(
+                                val.to_string(),
+                                Style::default().fg(Color::White),
+                            ),
+                        ]));
+                    }
+                }
+            }
+        }
+    }
+
+    let para = Paragraph::new(lines).wrap(Wrap { trim: false });
+    frame.render_widget(para, inner);
+}
+
+fn render_image_preview(app: &mut App, area: Rect) {
+    if !app.show_preview || area.height < 2 || area.width < 4 {
+        if let Some(old) = app.preview_img_area.take() {
+            clear_rect(old);
+        }
+        return;
+    }
+
+    if app.current_idx < app.dir_entries.len() || app.current_idx - app.dir_entries.len() >= app.files.len() {
+        if let Some(old) = app.preview_img_area.take() {
+            clear_rect(old);
+        }
+        return;
+    }
+
+    let fidx = app.current_idx - app.dir_entries.len();
+    let filepath = &app.files[fidx];
+
+    let tagged_file = match read_from_path(filepath) {
+        Ok(f) => f,
+        Err(_) => {
+            if let Some(old) = app.preview_img_area.take() { clear_rect(old); }
+            return;
+        }
+    };
+
+    let tag = match tagged_file.primary_tag().or_else(|| tagged_file.first_tag()) {
+        Some(t) => t,
+        None => {
+            if let Some(old) = app.preview_img_area.take() { clear_rect(old); }
+            return;
+        }
+    };
+
+    let picture = match tag.pictures().first() {
+        Some(p) => p,
+        None => {
+            if let Some(old) = app.preview_img_area.take() { clear_rect(old); }
+            return;
+        }
+    };
+
+    let data = picture.data().to_vec();
+    if data.is_empty() {
+        if let Some(old) = app.preview_img_area.take() { clear_rect(old); }
+        return;
+    }
+
+    if let Some(old) = app.preview_img_area.take() {
+        clear_rect(old);
+    }
+
+    let img = match image::load_from_memory(&data) {
+        Ok(i) => i,
+        Err(_) => return,
+    };
+
+    let img_w = img.width();
+    let img_h = img.height();
+
+    let term_h = (img_h / 2).max(1) as u16;
+    let final_h = term_h.min(area.height);
+    let final_w = ((img_w as u16) / 2).min(area.width);
+
+    let conf = viuer::Config {
+        x: area.x,
+        y: (area.y + area.height - final_h) as i16,
+        width: Some(final_w as u32),
+        height: Some(final_h as u32),
+        transparent: true,
+        ..Default::default()
+    };
+
+    let tmp = match tempfile::NamedTempFile::new() {
+        Ok(t) => t,
+        Err(_) => return,
+    };
+    let _ = std::fs::write(tmp.path(), &data);
+    let _ = viuer::print_from_file(tmp.path(), &conf);
+
+    app.preview_img_area = Some(Rect::new(area.x, area.y + area.height - final_h, final_w, final_h));
+}
+
+fn clear_rect(area: Rect) {
+    use crossterm::cursor::MoveTo;
+    let mut out = std::io::stdout();
+    for row in area.y..area.y + area.height {
+        let _ = crossterm::execute!(out, MoveTo(area.x, row));
+        let blank = " ".repeat(area.width as usize);
+        let _ = write!(out, "{}", blank);
+    }
+    let _ = out.flush();
 }
 
 fn render_filter_popup(frame: &mut Frame, app: &App) {
@@ -1422,13 +1864,79 @@ fn render_delete_confirm(frame: &mut Frame, app: &App) {
     );
 }
 
+fn render_cover_art_popup(frame: &mut Frame, app: &App) {
+    let area = frame.area();
+
+    let title = app.l.cover_title();
+    let hint = app.l.cover_hint();
+
+    let popup_width = (60).min(area.width.saturating_sub(4));
+    let popup_height = 5;
+    let x = area.width.saturating_sub(popup_width) / 2;
+    let y = area.height.saturating_sub(popup_height) / 2;
+
+    let popup_area = Rect::new(x, y, popup_width, popup_height);
+
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .style(Style::default().fg(Color::Cyan));
+
+    let inner = block.inner(popup_area);
+    frame.render_widget(block, popup_area);
+
+    let input_width = inner.width as usize;
+    let display_path = if app.cover_path.len() > input_width.saturating_sub(2) {
+        let start = app.cover_path.len().saturating_sub(input_width.saturating_sub(2));
+        format!("...{}", &app.cover_path[start..])
+    } else {
+        app.cover_path.clone()
+    };
+
+    let input_block = Block::default()
+        .borders(Borders::ALL)
+        .style(Style::default().fg(Color::White));
+
+    let input_area = Rect {
+        x: inner.x,
+        y: inner.y,
+        width: inner.width,
+        height: 3,
+    };
+    let input_inner = input_block.inner(input_area);
+    frame.render_widget(input_block, input_area);
+
+    let input_para = Paragraph::new(display_path);
+    frame.render_widget(input_para, input_inner);
+
+    if app.mode == AppMode::SetCoverArt {
+        let cursor_x = input_inner.x + app.cover_cursor as u16;
+        frame.set_cursor_position((cursor_x, input_inner.y));
+    }
+
+    let hint_para = Paragraph::new(hint)
+        .style(Style::default().fg(Color::Yellow))
+        .alignment(ratatui::layout::Alignment::Center);
+    frame.render_widget(
+        hint_para,
+        Rect {
+            x: inner.x,
+            y: inner.y + 3,
+            width: inner.width,
+            height: 1,
+        },
+    );
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let l = L::detect();
+
+    let (config_dir, show_preview) = load_config();
 
     let start_dir = std::env::args()
         .nth(1)
         .map(PathBuf::from)
-        .or_else(|| load_config())
+        .or(config_dir)
         .unwrap_or_else(|| dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")));
 
     let start_dir = if start_dir.exists() {
@@ -1444,12 +1952,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new(start_dir, l);
+    let mut app = App::new(start_dir, l, show_preview);
 
     eprintln!("{}", app.l.lang_detected());
 
     loop {
         terminal.draw(|f| ui(f, &app))?;
+
+        if app.show_preview && app.mode == AppMode::Browse {
+            let area = terminal.size()?;
+            let content_y = 3u16;
+            let content_h = area.height.saturating_sub(6);
+            let list_w = area.width * 60 / 100;
+            let preview_x = list_w;
+            let preview_w = area.width.saturating_sub(list_w);
+            if preview_w > 6 && content_h > 4 {
+                let preview_area = Rect::new(preview_x + 1, content_y + 1, preview_w.saturating_sub(2), content_h.saturating_sub(2));
+                render_image_preview(&mut app, preview_area);
+            }
+        }
 
         if let Event::Key(key) = event::read()? {
             app.handle_key(key);
