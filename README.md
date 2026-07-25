@@ -65,7 +65,7 @@ A music metadata editor written in Rust with a TUI, designed for audio files of 
 
 ```bash
 # From source (requires Rust)
-git clone https://github.com/youruser/musictag.git
+git clone https://github.com/NateInkDemon3070/musictag.git
 cd musictag
 chmod +x install.sh
 ./install.sh
