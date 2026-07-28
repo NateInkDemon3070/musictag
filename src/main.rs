@@ -1,5 +1,4 @@
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crossterm::{
@@ -19,15 +18,94 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
     Frame, Terminal,
 };
+use ratatui_image::{picker::Picker, protocol::StatefulProtocol, Resize, StatefulImage};
 
 const FIELD_KEYS: &[&str] = &[
     "title", "artist", "album", "albumartist", "year", "track", "disc", "genre", "comment",
 ];
 
 const SUPPORTED_EXT: &[&str] = &["mp3", "flac", "ogg", "opus", "m4a", "aac", "wma", "wav", "ape"];
+
+#[derive(Clone)]
+#[allow(dead_code)]
+struct ColorScheme {
+    background: Color,
+    foreground: Color,
+    header_bg: Color,
+    header_fg: Color,
+    dir_path: Color,
+    help_text: Color,
+    folder: Color,
+    selected: Color,
+    normal_file: Color,
+    highlight_bg: Color,
+    highlight_fg: Color,
+    info: Color,
+    error: Color,
+    success: Color,
+    edit_batch: Color,
+    edit_individual: Color,
+    active_label_bg: Color,
+    active_label_fg: Color,
+    inactive_label: Color,
+    active_value_bg: Color,
+    active_value_fg: Color,
+    empty_value: Color,
+    filled_value: Color,
+    preview_border: Color,
+    filter_border: Color,
+    delete_border: Color,
+    cover_border: Color,
+    input_border: Color,
+    metadata_label: Color,
+    metadata_value: Color,
+}
+
+impl Default for ColorScheme {
+    fn default() -> Self {
+        Self::catppuccin_mocha()
+    }
+}
+
+impl ColorScheme {
+    fn catppuccin_mocha() -> Self {
+        Self {
+            background: Color::Rgb(0x1e, 0x1e, 0x2e),
+            foreground: Color::Rgb(0xcd, 0xd6, 0xf4),
+            header_bg: Color::Rgb(0x31, 0x32, 0x44),
+            header_fg: Color::Rgb(0xcd, 0xd6, 0xf4),
+            dir_path: Color::Rgb(0xcd, 0xd6, 0xf4),
+            help_text: Color::Rgb(0xcd, 0xd6, 0xf4),
+            folder: Color::Rgb(0x89, 0xdc, 0xeb),
+            selected: Color::Rgb(0xcb, 0xa6, 0xf7),
+            normal_file: Color::Rgb(0xcd, 0xd6, 0xf4),
+            highlight_bg: Color::Rgb(0x89, 0xb4, 0xfa),
+            highlight_fg: Color::Rgb(0x1e, 0x1e, 0x2e),
+            info: Color::Rgb(0xcd, 0xd6, 0xf4),
+            error: Color::Rgb(0xf3, 0x8b, 0xa8),
+            success: Color::Rgb(0xa6, 0xe3, 0xa1),
+            edit_batch: Color::Rgb(0xcb, 0xa6, 0xf7),
+            edit_individual: Color::Rgb(0x89, 0xb4, 0xfa),
+            active_label_bg: Color::Rgb(0xf9, 0xe2, 0xaf),
+            active_label_fg: Color::Rgb(0x1e, 0x1e, 0x2e),
+            inactive_label: Color::Rgb(0xcd, 0xd6, 0xf4),
+            active_value_bg: Color::Rgb(0xcd, 0xd6, 0xf4),
+            active_value_fg: Color::Rgb(0x1e, 0x1e, 0x2e),
+            empty_value: Color::Rgb(0x6c, 0x70, 0x86),
+            filled_value: Color::Rgb(0xcd, 0xd6, 0xf4),
+            preview_border: Color::Rgb(0x45, 0x47, 0x5a),
+            filter_border: Color::Rgb(0xf9, 0xe2, 0xaf),
+            delete_border: Color::Rgb(0xf3, 0x8b, 0xa8),
+            cover_border: Color::Rgb(0x89, 0xb4, 0xfa),
+            input_border: Color::Rgb(0xcd, 0xd6, 0xf4),
+            metadata_label: Color::Rgb(0xcb, 0xa6, 0xf7),
+            metadata_value: Color::Rgb(0xcd, 0xd6, 0xf4),
+        }
+    }
+}
 
 fn config_path() -> PathBuf {
     dirs::config_dir()
@@ -224,11 +302,11 @@ impl L {
     fn help_browse(&self) -> String {
         match self.lang {
             Lang::Es => format!(
-                "{}{} mover  {} abrir  {} seleccionar  {} seleccionar todo  {} editar seleccion  {} eliminar  c:portada  P:preview  C:predeterminada  {} salir",
+                "{}{} mover  {} abrir  {} seleccionar  {} seleccionar todo  {} editar seleccion  {} eliminar  c:portada  P:preview  R:colores  C:predeterminada  {} salir",
                 icon::ARROW_UP, icon::ARROW_DOWN, icon::ARROW_RIGHT, icon::SELECT, icon::BULK, icon::EDIT, icon::TRASH, icon::CLOSE,
             ),
             Lang::En => format!(
-                "{}{} move  {} open  {} select  {} select all  {} edit selected  {} delete  c:cover  P:preview  C:default  {} quit",
+                "{}{} move  {} open  {} select  {} select all  {} edit selected  {} delete  c:cover  P:preview  R:colors  C:default  {} quit",
                 icon::ARROW_UP, icon::ARROW_DOWN, icon::ARROW_RIGHT, icon::SELECT, icon::BULK, icon::EDIT, icon::TRASH, icon::CLOSE,
             ),
         }
@@ -482,6 +560,13 @@ impl L {
             Lang::En => format!("{} Image preview disabled", icon::CHECK),
         }
     }
+
+    fn reload_colors(&self) -> String {
+        match self.lang {
+            Lang::Es => format!("{} Colores recargados", icon::CHECK),
+            Lang::En => format!("{} Colors reloaded", icon::CHECK),
+        }
+    }
 }
 
 fn field_key(key: &str) -> ItemKey {
@@ -527,11 +612,13 @@ struct App {
     cover_path: String,
     cover_cursor: usize,
     show_preview: bool,
-    preview_img_area: Option<Rect>,
     status_msg: String,
     status_is_error: bool,
     should_quit: bool,
     l: L,
+    colors: ColorScheme,
+    picker: Option<Picker>,
+    cover_protocol: Option<StatefulProtocol>,
 }
 
 impl App {
@@ -555,11 +642,13 @@ impl App {
             cover_path: String::new(),
             cover_cursor: 0,
             show_preview,
-            preview_img_area: None,
             status_msg: String::new(),
             status_is_error: false,
             should_quit: false,
             l,
+            colors: ColorScheme::default(),
+            picker: None,
+            cover_protocol: None,
         };
         app.load_dir();
         app
@@ -613,6 +702,44 @@ impl App {
         if total > 0 && self.current_idx >= total {
             self.current_idx = total - 1;
         }
+        self.update_cover_state();
+    }
+
+    fn update_cover_state(&mut self) {
+        self.cover_protocol = None;
+        let picker = match &self.picker {
+            Some(p) => p,
+            None => return,
+        };
+        if self.current_idx < self.dir_entries.len() {
+            return;
+        }
+        let fidx = self.current_idx - self.dir_entries.len();
+        if fidx >= self.files.len() {
+            return;
+        }
+        let filepath = &self.files[fidx];
+        let tagged_file = match read_from_path(filepath) {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+        let tag = match tagged_file.primary_tag().or_else(|| tagged_file.first_tag()) {
+            Some(t) => t,
+            None => return,
+        };
+        let picture = match tag.pictures().first() {
+            Some(p) => p,
+            None => return,
+        };
+        let data = picture.data().to_vec();
+        if data.is_empty() {
+            return;
+        }
+        let img = match image::load_from_memory(&data) {
+            Ok(i) => i,
+            Err(_) => return,
+        };
+        self.cover_protocol = Some(picker.new_resize_protocol(img));
     }
 
     fn total_items(&self) -> usize {
@@ -977,6 +1104,11 @@ impl App {
             KeyCode::Char('c') => {
                 self.enter_set_cover_art();
             }
+            KeyCode::Char('R') => {
+                self.colors = ColorScheme::default();
+                self.status_msg = self.l.reload_colors();
+                self.status_is_error = false;
+            }
             KeyCode::Char('P') => {
                 self.show_preview = !self.show_preview;
                 self.status_msg = if self.show_preview {
@@ -988,6 +1120,7 @@ impl App {
             }
             _ => {}
         }
+        self.update_cover_state();
     }
 
     fn handle_edit_key(&mut self, key: KeyEvent) {
@@ -1162,6 +1295,7 @@ impl App {
                 }
                 if self.apply_cover_art() {
                     self.mode = AppMode::Browse;
+                    self.update_cover_state();
                 }
             }
             KeyCode::Char(c) => {
@@ -1290,7 +1424,7 @@ fn set_cover_art(filepath: &Path, image_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn ui(frame: &mut Frame, app: &App) {
+fn ui(frame: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -1306,8 +1440,8 @@ fn ui(frame: &mut Frame, app: &App) {
     let chunks: Vec<Rect> = chunks.iter().copied().collect();
 
     let header_style = Style::default()
-        .fg(Color::Black)
-        .bg(Color::Cyan)
+        .fg(app.colors.header_fg)
+        .bg(app.colors.header_bg)
         .add_modifier(Modifier::BOLD);
     let header = Paragraph::new(app.l.header_title()).style(header_style);
     frame.render_widget(header, chunks[0]);
@@ -1330,16 +1464,16 @@ fn ui(frame: &mut Frame, app: &App) {
     }
 }
 
-fn render_browse(frame: &mut Frame, app: &App, chunks: &[Rect]) {
+fn render_browse(frame: &mut Frame, app: &mut App, chunks: &[Rect]) {
     let dir_style = Style::default()
-        .fg(Color::Cyan)
+        .fg(app.colors.dir_path)
         .add_modifier(Modifier::BOLD);
     let dir_text = format!(" {} {}", icon::FOLDER, app.current_dir.display());
     let dir_para = Paragraph::new(dir_text).style(dir_style);
     frame.render_widget(dir_para, chunks[2]);
 
     let help_para = Paragraph::new(app.l.help_browse())
-        .style(Style::default().fg(Color::Yellow))
+        .style(Style::default().fg(app.colors.help_text))
         .alignment(ratatui::layout::Alignment::Center);
     frame.render_widget(help_para, chunks[1]);
 
@@ -1376,27 +1510,30 @@ fn render_browse(frame: &mut Frame, app: &App, chunks: &[Rect]) {
             let name = item.file_name().unwrap_or_default().to_string_lossy();
             let is_selected = app.selected.contains(&idx);
 
-            let (icon_str, style) = if is_dir {
+            let (icon_str, icon_style) = if is_dir {
                 (
                     format!("{} ", icon::FOLDER),
                     Style::default()
-                        .fg(Color::Cyan)
+                        .fg(app.colors.folder)
                         .add_modifier(Modifier::BOLD),
                 )
             } else if is_selected {
                 (
                     format!("{} ", icon::CHECK),
-                    Style::default().fg(Color::Magenta),
+                    Style::default().fg(app.colors.selected),
                 )
             } else {
                 (
                     format!("{} ", icon::MUSIC_FILE),
-                    Style::default().fg(Color::Green),
+                    Style::default().fg(app.colors.normal_file),
                 )
             };
 
-            let display = format!("{}{}", icon_str, name);
-            ListItem::new(Line::from(Span::styled(display, style)))
+            let line = Line::from(vec![
+                Span::styled(icon_str, icon_style),
+                Span::styled(name, Style::default().fg(Color::Rgb(255, 255, 255))),
+            ]);
+            ListItem::new(line)
         })
         .collect();
 
@@ -1410,8 +1547,8 @@ fn render_browse(frame: &mut Frame, app: &App, chunks: &[Rect]) {
         .block(Block::default().borders(Borders::NONE))
         .highlight_style(
             Style::default()
-                .bg(Color::Cyan)
-                .fg(Color::Black)
+                .bg(app.colors.highlight_bg)
+                .fg(app.colors.highlight_fg)
                 .add_modifier(Modifier::BOLD),
         );
 
@@ -1430,7 +1567,7 @@ fn render_browse(frame: &mut Frame, app: &App, chunks: &[Rect]) {
     }
 
     let info_style = Style::default()
-        .fg(Color::Yellow)
+        .fg(app.colors.info)
         .add_modifier(Modifier::DIM);
     let info_para = Paragraph::new(info)
         .style(info_style)
@@ -1440,11 +1577,11 @@ fn render_browse(frame: &mut Frame, app: &App, chunks: &[Rect]) {
     if !app.status_msg.is_empty() {
         let status_style = if app.status_is_error {
             Style::default()
-                .fg(Color::Red)
+                .fg(app.colors.error)
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default()
-                .fg(Color::Green)
+                .fg(app.colors.success)
                 .add_modifier(Modifier::BOLD)
         };
         let status_para = Paragraph::new(app.status_msg.clone())
@@ -1469,16 +1606,16 @@ fn render_edit(frame: &mut Frame, app: &App, chunks: &[Rect]) {
 
     let title_style = Style::default()
         .fg(if app.batch_mode {
-            Color::Magenta
+            app.colors.edit_batch
         } else {
-            Color::Cyan
+            app.colors.edit_individual
         })
         .add_modifier(Modifier::BOLD);
     let title = Paragraph::new(title_text).style(title_style);
     frame.render_widget(title, chunks[2]);
 
     let help_para = Paragraph::new(app.l.help_edit())
-        .style(Style::default().fg(Color::Yellow))
+        .style(Style::default().fg(app.colors.help_text))
         .alignment(ratatui::layout::Alignment::Center);
     frame.render_widget(help_para, chunks[1]);
 
@@ -1499,12 +1636,12 @@ fn render_edit(frame: &mut Frame, app: &App, chunks: &[Rect]) {
             format!("  {} {:<22}", arrow, label),
             if is_active {
                 Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Yellow)
+                    .fg(app.colors.active_label_fg)
+                    .bg(app.colors.active_label_bg)
                     .add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
-                    .fg(Color::Magenta)
+                    .fg(app.colors.inactive_label)
                     .add_modifier(Modifier::BOLD)
             },
         );
@@ -1517,15 +1654,15 @@ fn render_edit(frame: &mut Frame, app: &App, chunks: &[Rect]) {
 
         let val_style = if is_active {
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::White)
+                .fg(app.colors.active_value_fg)
+                .bg(app.colors.active_value_bg)
                 .add_modifier(Modifier::BOLD)
         } else if val.is_empty() {
             Style::default()
-                .fg(Color::DarkGray)
+                .fg(app.colors.empty_value)
                 .add_modifier(Modifier::ITALIC)
         } else {
-            Style::default().fg(Color::Green)
+            Style::default().fg(app.colors.filled_value)
         };
 
         let val_span = Span::styled(val_display, val_style);
@@ -1537,7 +1674,7 @@ fn render_edit(frame: &mut Frame, app: &App, chunks: &[Rect]) {
     frame.render_widget(form_widget, chunks[3]);
 
     let status_style = Style::default()
-        .fg(Color::Yellow)
+        .fg(app.colors.info)
         .add_modifier(Modifier::DIM);
     let status = Paragraph::new(app.l.status_field(
         app.edit_idx + 1,
@@ -1551,11 +1688,11 @@ fn render_edit(frame: &mut Frame, app: &App, chunks: &[Rect]) {
     if !app.status_msg.is_empty() {
         let status_style = if app.status_is_error {
             Style::default()
-                .fg(Color::Red)
+                .fg(app.colors.error)
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default()
-                .fg(Color::Green)
+                .fg(app.colors.success)
                 .add_modifier(Modifier::BOLD)
         };
         let status_para = Paragraph::new(app.status_msg.clone())
@@ -1566,10 +1703,10 @@ fn render_edit(frame: &mut Frame, app: &App, chunks: &[Rect]) {
 }
 
 
-fn render_preview(frame: &mut Frame, app: &App, area: Rect) {
+fn render_preview(frame: &mut Frame, app: &mut App, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray))
+        .border_style(Style::default().fg(app.colors.preview_border))
         .title(" Preview ");
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -1578,196 +1715,131 @@ fn render_preview(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
+    let fidx = app.current_idx.checked_sub(app.dir_entries.len());
+
+    let mut lines: Vec<Line> = Vec::new();
+
     if app.current_idx < app.dir_entries.len() {
         let dir_name = app.dir_entries[app.current_idx]
             .file_name()
             .unwrap_or_default()
             .to_string_lossy();
-        let text = format!("{}\n{}", icon::FOLDER, dir_name);
-        let para = Paragraph::new(text)
-            .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
-        frame.render_widget(para, inner);
-        return;
-    }
-
-    let fidx = app.current_idx - app.dir_entries.len();
-    if fidx >= app.files.len() {
-        return;
-    }
-
-    let filepath = &app.files[fidx];
-    let filename = filepath
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_string();
-
-    let ext = filepath
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_uppercase();
-
-    let mut lines: Vec<Line> = Vec::new();
-    lines.push(Line::from(Span::styled(
-        format!("{} {}", icon::MUSIC_FILE, filename),
-        Style::default()
-            .fg(Color::Green)
-            .add_modifier(Modifier::BOLD),
-    )));
-    lines.push(Line::from(Span::styled(
-        format!("  {}", ext),
-        Style::default().fg(Color::DarkGray),
-    )));
-
-    if let Ok(meta) = std::fs::metadata(filepath) {
-        let size = if meta.len() >= 1_048_576 {
-            format!("{:.1} MB", meta.len() as f64 / 1_048_576.0)
-        } else if meta.len() >= 1024 {
-            format!("{:.1} KB", meta.len() as f64 / 1024.0)
-        } else {
-            format!("{} B", meta.len())
-        };
+        let text = format!("{} {}", icon::FOLDER, dir_name);
         lines.push(Line::from(Span::styled(
-            format!("  {}", size),
-            Style::default().fg(Color::DarkGray),
+            text,
+            Style::default().fg(app.colors.folder).add_modifier(Modifier::BOLD),
         )));
-    }
+    } else if let Some(fidx) = fidx {
+        if fidx >= app.files.len() {
+            return;
+        }
+        let filepath = &app.files[fidx];
+        let filename = filepath
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
 
-    if let Ok(tagged_file) = read_from_path(filepath) {
-        if let Some(tag) = tagged_file
-            .primary_tag()
-            .or_else(|| tagged_file.first_tag())
-        {
-            lines.push(Line::from(""));
+        let ext = filepath
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_uppercase();
 
-            let fields = [
-                (ItemKey::TrackTitle, app.l.field_title()),
-                (ItemKey::TrackArtist, app.l.field_artist()),
-                (ItemKey::AlbumTitle, app.l.field_album()),
-                (ItemKey::RecordingDate, app.l.field_year()),
-                (ItemKey::Genre, app.l.field_genre()),
-                (ItemKey::TrackNumber, app.l.field_track()),
-            ];
+        lines.push(Line::from(Span::styled(
+            format!("{} {}", icon::MUSIC_FILE, filename),
+            Style::default()
+                .fg(app.colors.normal_file)
+                .add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(Span::styled(
+            format!("  {}", ext),
+            Style::default().fg(app.colors.empty_value),
+        )));
 
-            for (key, label) in fields.iter() {
-                if let Some(val) = tag.get_string(key) {
-                    if !val.is_empty() {
-                        lines.push(Line::from(vec![
-                            Span::styled(
-                                format!("  {}: ", label),
-                                Style::default()
-                                    .fg(Color::Magenta)
-                                    .add_modifier(Modifier::BOLD),
-                            ),
-                            Span::styled(
-                                val.to_string(),
-                                Style::default().fg(Color::White),
-                            ),
-                        ]));
+        if let Ok(meta) = std::fs::metadata(filepath) {
+            let size = if meta.len() >= 1_048_576 {
+                format!("{:.1} MB", meta.len() as f64 / 1_048_576.0)
+            } else if meta.len() >= 1024 {
+                format!("{:.1} KB", meta.len() as f64 / 1024.0)
+            } else {
+                format!("{} B", meta.len())
+            };
+            lines.push(Line::from(Span::styled(
+                format!("  {}", size),
+                Style::default().fg(app.colors.empty_value),
+            )));
+        }
+
+        if let Ok(tagged_file) = read_from_path(filepath) {
+            if let Some(tag) = tagged_file
+                .primary_tag()
+                .or_else(|| tagged_file.first_tag())
+            {
+                lines.push(Line::from(""));
+
+                let fields = [
+                    (ItemKey::TrackTitle, app.l.field_title()),
+                    (ItemKey::TrackArtist, app.l.field_artist()),
+                    (ItemKey::AlbumTitle, app.l.field_album()),
+                    (ItemKey::RecordingDate, app.l.field_year()),
+                    (ItemKey::Genre, app.l.field_genre()),
+                    (ItemKey::TrackNumber, app.l.field_track()),
+                ];
+
+                for (key, label) in fields.iter() {
+                    if let Some(val) = tag.get_string(key) {
+                        if !val.is_empty() {
+                            lines.push(Line::from(vec![
+                                Span::styled(
+                                    format!("  {}: ", label),
+                                    Style::default()
+                                        .fg(app.colors.metadata_label)
+                                        .add_modifier(Modifier::BOLD),
+                                ),
+                                Span::styled(
+                                    val.to_string(),
+                                    Style::default().fg(app.colors.metadata_value),
+                                ),
+                            ]));
+                        }
                     }
                 }
             }
         }
     }
 
-    let para = Paragraph::new(lines).wrap(Wrap { trim: false });
-    frame.render_widget(para, inner);
-}
-
-fn render_image_preview(app: &mut App, area: Rect) {
-    if !app.show_preview || area.height < 2 || area.width < 4 {
-        if let Some(old) = app.preview_img_area.take() {
-            clear_rect(old);
-        }
+    if lines.is_empty() {
         return;
     }
 
-    if app.current_idx < app.dir_entries.len() || app.current_idx - app.dir_entries.len() >= app.files.len() {
-        if let Some(old) = app.preview_img_area.take() {
-            clear_rect(old);
+    let line_count = lines.len() as u16;
+
+    if app.cover_protocol.is_some() {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(line_count), Constraint::Min(0)])
+            .split(inner);
+        let top = chunks[0];
+        let bottom = chunks[1];
+
+        let para = Paragraph::new(lines).wrap(Wrap { trim: false });
+        frame.render_widget(para, top);
+
+        if let Some(protocol) = &mut app.cover_protocol {
+            if bottom.height >= 2 && bottom.width >= 4 {
+                frame.render_widget(Clear, bottom);
+                let image = StatefulImage::default().resize(Resize::Fit(None));
+                frame.render_stateful_widget(image, bottom, protocol);
+            }
         }
-        return;
+    } else {
+        let para = Paragraph::new(lines).wrap(Wrap { trim: false });
+        frame.render_widget(para, inner);
     }
-
-    let fidx = app.current_idx - app.dir_entries.len();
-    let filepath = &app.files[fidx];
-
-    let tagged_file = match read_from_path(filepath) {
-        Ok(f) => f,
-        Err(_) => {
-            if let Some(old) = app.preview_img_area.take() { clear_rect(old); }
-            return;
-        }
-    };
-
-    let tag = match tagged_file.primary_tag().or_else(|| tagged_file.first_tag()) {
-        Some(t) => t,
-        None => {
-            if let Some(old) = app.preview_img_area.take() { clear_rect(old); }
-            return;
-        }
-    };
-
-    let picture = match tag.pictures().first() {
-        Some(p) => p,
-        None => {
-            if let Some(old) = app.preview_img_area.take() { clear_rect(old); }
-            return;
-        }
-    };
-
-    let data = picture.data().to_vec();
-    if data.is_empty() {
-        if let Some(old) = app.preview_img_area.take() { clear_rect(old); }
-        return;
-    }
-
-    if let Some(old) = app.preview_img_area.take() {
-        clear_rect(old);
-    }
-
-    let img = match image::load_from_memory(&data) {
-        Ok(i) => i,
-        Err(_) => return,
-    };
-
-    let img_w = img.width();
-    let img_h = img.height();
-
-    let term_h = (img_h / 2).max(1) as u16;
-    let final_h = term_h.min(area.height);
-    let final_w = ((img_w as u16) / 2).min(area.width);
-
-    let conf = viuer::Config {
-        x: area.x,
-        y: (area.y + area.height - final_h) as i16,
-        width: Some(final_w as u32),
-        height: Some(final_h as u32),
-        transparent: true,
-        ..Default::default()
-    };
-
-    let tmp = match tempfile::NamedTempFile::new() {
-        Ok(t) => t,
-        Err(_) => return,
-    };
-    let _ = std::fs::write(tmp.path(), &data);
-    let _ = viuer::print_from_file(tmp.path(), &conf);
-
-    app.preview_img_area = Some(Rect::new(area.x, area.y + area.height - final_h, final_w, final_h));
 }
 
-fn clear_rect(area: Rect) {
-    use crossterm::cursor::MoveTo;
-    let mut out = std::io::stdout();
-    for row in area.y..area.y + area.height {
-        let _ = crossterm::execute!(out, MoveTo(area.x, row));
-        let blank = " ".repeat(area.width as usize);
-        let _ = write!(out, "{}", blank);
-    }
-    let _ = out.flush();
-}
+
 
 fn render_filter_popup(frame: &mut Frame, app: &App) {
     let area = frame.area();
@@ -1781,13 +1853,13 @@ fn render_filter_popup(frame: &mut Frame, app: &App) {
     let block = Block::default()
         .title(app.l.filter_title())
         .borders(Borders::ALL)
-        .style(Style::default().fg(Color::Yellow));
+        .style(Style::default().fg(app.colors.filter_border));
 
     let filter_display = format!("> {}_", app.filter_text);
     let filter_para = Paragraph::new(filter_display).style(
         Style::default()
-            .fg(Color::Black)
-            .bg(Color::White)
+            .fg(app.colors.active_label_fg)
+            .bg(app.colors.active_value_bg)
             .add_modifier(Modifier::BOLD),
     );
 
@@ -1828,7 +1900,7 @@ fn render_delete_confirm(frame: &mut Frame, app: &App) {
     let block = Block::default()
         .title(app.l.confirm_delete_title())
         .borders(Borders::ALL)
-        .style(Style::default().fg(Color::Red));
+        .style(Style::default().fg(app.colors.delete_border));
 
     let inner = block.inner(popup_area);
     frame.render_widget(block, popup_area);
@@ -1836,7 +1908,7 @@ fn render_delete_confirm(frame: &mut Frame, app: &App) {
     let msg_para = Paragraph::new(msg)
         .style(
             Style::default()
-                .fg(Color::White)
+                .fg(app.colors.foreground)
                 .add_modifier(Modifier::BOLD),
         )
         .alignment(ratatui::layout::Alignment::Center);
@@ -1851,7 +1923,7 @@ fn render_delete_confirm(frame: &mut Frame, app: &App) {
     );
 
     let hint = Paragraph::new(app.l.confirm_hint())
-        .style(Style::default().fg(Color::Yellow))
+        .style(Style::default().fg(app.colors.help_text))
         .alignment(ratatui::layout::Alignment::Center);
     frame.render_widget(
         hint,
@@ -1880,7 +1952,7 @@ fn render_cover_art_popup(frame: &mut Frame, app: &App) {
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
-        .style(Style::default().fg(Color::Cyan));
+        .style(Style::default().fg(app.colors.cover_border));
 
     let inner = block.inner(popup_area);
     frame.render_widget(block, popup_area);
@@ -1895,7 +1967,7 @@ fn render_cover_art_popup(frame: &mut Frame, app: &App) {
 
     let input_block = Block::default()
         .borders(Borders::ALL)
-        .style(Style::default().fg(Color::White));
+        .style(Style::default().fg(app.colors.input_border));
 
     let input_area = Rect {
         x: inner.x,
@@ -1915,7 +1987,7 @@ fn render_cover_art_popup(frame: &mut Frame, app: &App) {
     }
 
     let hint_para = Paragraph::new(hint)
-        .style(Style::default().fg(Color::Yellow))
+        .style(Style::default().fg(app.colors.help_text))
         .alignment(ratatui::layout::Alignment::Center);
     frame.render_widget(
         hint_para,
@@ -1956,21 +2028,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     eprintln!("{}", app.l.lang_detected());
 
-    loop {
-        terminal.draw(|f| ui(f, &app))?;
+    app.picker = Some(Picker::from_query_stdio()?);
+    app.update_cover_state();
 
-        if app.show_preview && app.mode == AppMode::Browse {
-            let area = terminal.size()?;
-            let content_y = 3u16;
-            let content_h = area.height.saturating_sub(6);
-            let list_w = area.width * 60 / 100;
-            let preview_x = list_w;
-            let preview_w = area.width.saturating_sub(list_w);
-            if preview_w > 6 && content_h > 4 {
-                let preview_area = Rect::new(preview_x + 1, content_y + 1, preview_w.saturating_sub(2), content_h.saturating_sub(2));
-                render_image_preview(&mut app, preview_area);
-            }
-        }
+    loop {
+        terminal.draw(|f| ui(f, &mut app))?;
 
         if let Event::Key(key) = event::read()? {
             app.handle_key(key);

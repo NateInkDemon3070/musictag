@@ -8,6 +8,5 @@ ratatui = "0.29"
 crossterm = "0.28"
 lofty = "0.21"
 dirs = "6"
-viuer = "0.8"
 image = "0.25"
-tempfile = "3"
+ratatui-image = { version = "9", default-features = false, features = ["crossterm"] }
