@@ -1,5 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::thread;
 
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
@@ -22,6 +24,109 @@ use ratatui::{
     Frame, Terminal,
 };
 use ratatui_image::{picker::Picker, protocol::StatefulProtocol, Resize, StatefulImage};
+use serde::Deserialize;
+
+#[derive(Deserialize)]
+struct MbResponse {
+    recordings: Vec<MbRecording>,
+}
+
+#[derive(Deserialize)]
+struct MbRecording {
+    title: String,
+    #[serde(rename = "artist-credit")]
+    artist_credit: Vec<MbArtistCredit>,
+    releases: Option<Vec<MbRelease>>,
+}
+
+#[derive(Deserialize)]
+struct MbArtistCredit {
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct MbRelease {
+    id: String,
+    title: String,
+    date: Option<String>,
+    status: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct MbReleaseDetail {
+    #[serde(rename = "artist-credit")]
+    artist_credit: Option<Vec<MbArtistCredit>>,
+    media: Option<Vec<MbMedium>>,
+    tags: Option<Vec<MbTag>>,
+}
+
+#[derive(Deserialize)]
+#[allow(dead_code)]
+struct MbMedium {
+    position: Option<u16>,
+    #[serde(rename = "track-count")]
+    track_count: Option<u16>,
+}
+
+#[derive(Deserialize)]
+#[allow(dead_code)]
+struct MbTag {
+    name: String,
+    count: Option<u16>,
+}
+
+#[derive(Deserialize)]
+struct MbReleaseSearchResponse {
+    releases: Vec<MbReleaseSearchResult>,
+}
+
+#[derive(Deserialize)]
+struct MbReleaseSearchResult {
+    id: String,
+    title: String,
+    date: Option<String>,
+    status: Option<String>,
+    #[serde(rename = "artist-credit")]
+    artist_credit: Option<Vec<MbArtistCredit>>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum MbSource {
+    Recording,
+    Release,
+}
+
+struct MbSuggestion {
+    source: MbSource,
+    title: String,
+    artist: String,
+    album: String,
+    albumartist: String,
+    year: String,
+    disc: String,
+    genre: String,
+    comment: String,
+    release_id: String,
+    release_status: String,
+}
+
+enum CoverState {
+    None,
+    Loading,
+    Loaded(Vec<u8>),
+    Error(String),
+}
+
+enum MbState {
+    Idle,
+    LoadingSuggestions,
+    Suggestions {
+        results: Vec<MbSuggestion>,
+        index: usize,
+        cover_state: CoverState,
+    },
+    Error(String),
+}
 
 const FIELD_KEYS: &[&str] = &[
     "title", "artist", "album", "albumartist", "year", "track", "disc", "genre", "comment",
@@ -233,12 +338,15 @@ impl L {
     }
 
     fn field_album(&self) -> &str {
-        "Album"
+        match self.lang {
+            Lang::Es => "Álbum",
+            Lang::En => "Album",
+        }
     }
 
     fn field_albumartist(&self) -> &str {
         match self.lang {
-            Lang::Es => "Artista del Album",
+            Lang::Es => "Artista del Álbum",
             Lang::En => "Album Artist",
         }
     }
@@ -294,32 +402,26 @@ impl L {
 
     fn header_title(&self) -> String {
         match self.lang {
-            Lang::Es => format!(" {} musictag - Editor de Metadatos de Musica ", icon::TAG),
+            Lang::Es => format!(" {} musictag - Editor de Metadatos de Música ", icon::TAG),
             Lang::En => format!(" {} musictag - Music Metadata Editor ", icon::TAG),
         }
     }
 
     fn help_browse(&self) -> String {
         match self.lang {
-            Lang::Es => format!(
-                "{}{} mover  {} abrir  {} seleccionar  {} seleccionar todo  {} editar seleccion  {} eliminar  c:portada  P:preview  R:colores  C:predeterminada  {} salir",
-                icon::ARROW_UP, icon::ARROW_DOWN, icon::ARROW_RIGHT, icon::SELECT, icon::BULK, icon::EDIT, icon::TRASH, icon::CLOSE,
-            ),
-            Lang::En => format!(
-                "{}{} move  {} open  {} select  {} select all  {} edit selected  {} delete  c:cover  P:preview  R:colors  C:default  {} quit",
-                icon::ARROW_UP, icon::ARROW_DOWN, icon::ARROW_RIGHT, icon::SELECT, icon::BULK, icon::EDIT, icon::TRASH, icon::CLOSE,
-            ),
+            Lang::Es => " j/k:mover  l/Enter:abrir  espacio:seleccionar  v:seleccionar todo  a:editar seleccion  x:eliminar  c:portada  e:extraer  P:preview  C:predeterminada  q:salir".into(),
+            Lang::En => " j/k:move  l/Enter:open  space:select  v:select all  a:edit selected  x:delete  c:cover  e:extract  P:preview  C:default  q:quit".into(),
         }
     }
 
     fn help_edit(&self) -> String {
         match self.lang {
             Lang::Es => format!(
-                "{}{} campo  {}{} cursor  Enter:guardar  Esc:cancelar  Ctrl+S:guardar y avanzar",
+                "{}{} campo  {}{} cursor  Ctrl+G:aplicar MB  Re/Av Pág:navegar MB  Enter:guardar  Esc:cancelar  Ctrl+S:guardar y avanzar",
                 icon::ARROW_UP, icon::ARROW_DOWN, icon::ARROW_LEFT, icon::ARROW_RIGHT,
             ),
             Lang::En => format!(
-                "{}{} field  {}{} cursor  Enter:save  Esc:cancel  Ctrl+S:save & next",
+                "{}{} field  {}{} cursor  Ctrl+G:apply MB  PgUp/PgDn:MB nav  Enter:save  Esc:cancel  Ctrl+S:save & next",
                 icon::ARROW_UP, icon::ARROW_DOWN, icon::ARROW_LEFT, icon::ARROW_RIGHT,
             ),
         }
@@ -492,7 +594,7 @@ impl L {
 
     fn lang_detected(&self) -> String {
         match self.lang {
-            Lang::Es => format!("{} Idioma detectado: Espanol", icon::GLOBE),
+            Lang::Es => format!("{} Idioma detectado: Español", icon::GLOBE),
             Lang::En => format!("{} Language detected: English", icon::GLOBE),
         }
     }
@@ -537,6 +639,13 @@ impl L {
         match self.lang {
             Lang::Es => format!(" {} Asignar portada ", icon::IMAGE),
             Lang::En => format!(" {} Set cover art ", icon::IMAGE),
+        }
+    }
+
+    fn cover_batch_title(&self, count: usize) -> String {
+        match self.lang {
+            Lang::Es => format!(" {} Asignar portada ({} archivos) ", icon::IMAGE, count),
+            Lang::En => format!(" {} Set cover art ({} files) ", icon::IMAGE, count),
         }
     }
 
@@ -619,6 +728,11 @@ struct App {
     colors: ColorScheme,
     picker: Option<Picker>,
     cover_protocol: Option<StatefulProtocol>,
+    mb_state: MbState,
+    mb_rx: Option<mpsc::Receiver<MbState>>,
+    cover_rx: Option<mpsc::Receiver<CoverState>>,
+    detail_rx: Option<mpsc::Receiver<MbSuggestion>>,
+    mb_cover_protocol: Option<StatefulProtocol>,
 }
 
 impl App {
@@ -649,6 +763,11 @@ impl App {
             colors: ColorScheme::default(),
             picker: None,
             cover_protocol: None,
+            mb_state: MbState::Idle,
+            mb_rx: None,
+            cover_rx: None,
+            detail_rx: None,
+            mb_cover_protocol: None,
         };
         app.load_dir();
         app
@@ -742,6 +861,53 @@ impl App {
         self.cover_protocol = Some(picker.new_resize_protocol(img));
     }
 
+    fn check_mb_results(&mut self) {
+        if let Some(rx) = &self.mb_rx {
+            if let Ok(state) = rx.try_recv() {
+                self.mb_state = state;
+                self.mb_rx = None;
+                if let MbState::Suggestions { results, .. } = &self.mb_state {
+                    if !results.is_empty() {
+                        self.download_mb_cover(0);
+                        self.load_mb_detail(0);
+                    }
+                }
+            }
+        }
+        if let Some(rx) = &self.cover_rx {
+            if let Ok(cover) = rx.try_recv() {
+                self.cover_rx = None;
+                let index = if let MbState::Suggestions { index, .. } = &self.mb_state {
+                    *index
+                } else {
+                    return;
+                };
+                if let MbState::Suggestions { cover_state, .. } = &mut self.mb_state {
+                    *cover_state = cover;
+                }
+                self.decode_mb_cover(index);
+            }
+        }
+        if let Some(rx) = &self.detail_rx {
+            if let Ok(detail) = rx.try_recv() {
+                self.detail_rx = None;
+                if let MbState::Suggestions { results, index, .. } = &mut self.mb_state {
+                    if *index < results.len() {
+                        if !detail.albumartist.is_empty() {
+                            results[*index].albumartist = detail.albumartist;
+                        }
+                        if !detail.disc.is_empty() {
+                            results[*index].disc = detail.disc;
+                        }
+                        if !detail.genre.is_empty() {
+                            results[*index].genre = detail.genre;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn total_items(&self) -> usize {
         self.dir_entries.len() + self.files.len()
     }
@@ -764,6 +930,12 @@ impl App {
     }
 
     fn enter_edit_mode(&mut self, batch: bool) {
+        self.mb_state = MbState::Idle;
+        self.mb_rx = None;
+        self.cover_rx = None;
+        self.detail_rx = None;
+        self.mb_cover_protocol = None;
+
         if batch && !self.selected.is_empty() {
             self.batch_mode = true;
             self.batch_indices = self.selected.iter().copied().collect();
@@ -783,6 +955,7 @@ impl App {
                     self.edit_cursor = self.edit_vals[0].len();
                     self.mode = AppMode::Edit;
                     self.status_msg.clear();
+                    self.query_mb();
                 }
                 None => {
                     self.status_msg = self.l.err_could_not_read();
@@ -809,6 +982,7 @@ impl App {
                     self.edit_cursor = self.edit_vals[0].len();
                     self.mode = AppMode::Edit;
                     self.status_msg.clear();
+                    self.query_mb();
                 }
                 None => {
                     let name = filepath.file_name().unwrap_or_default().to_string_lossy();
@@ -816,6 +990,211 @@ impl App {
                     self.status_is_error = true;
                 }
             }
+        }
+    }
+
+    fn query_mb(&mut self) {
+        let title = self.edit_vals.first().map(|s| s.trim()).unwrap_or("");
+        let artist = self.edit_vals.get(1).map(|s| s.trim()).unwrap_or("");
+        let album = self.edit_vals.get(2).map(|s| s.trim()).unwrap_or("");
+        if title.is_empty() && artist.is_empty() && album.is_empty() {
+            self.mb_state = MbState::Idle;
+            return;
+        }
+        self.mb_state = MbState::LoadingSuggestions;
+        let (tx, rx) = mpsc::channel();
+        self.mb_rx = Some(rx);
+        let title = title.to_string();
+        let artist = artist.to_string();
+        let album = album.to_string();
+        thread::spawn(move || {
+            let result = query_musicbrainz(&title, &artist, &album);
+            let _ = tx.send(result);
+        });
+    }
+
+    fn download_mb_cover(&mut self, index: usize) {
+        if let MbState::Suggestions { results, cover_state, .. } = &mut self.mb_state {
+            if index >= results.len() {
+                return;
+            }
+            let rid = results[index].release_id.clone();
+            if rid.is_empty() {
+                *cover_state = CoverState::None;
+                return;
+            }
+            *cover_state = CoverState::Loading;
+            let (tx, rx) = mpsc::channel();
+            self.cover_rx = Some(rx);
+            thread::spawn(move || {
+                let url = format!("https://coverartarchive.org/release/{}/front", rid);
+                let config = ureq::Agent::config_builder()
+                    .user_agent("musictag/0.1.0 ( jpablo@example.com )")
+                    .build();
+                let agent = ureq::Agent::new_with_config(config);
+                let resp = match agent.get(&url).call() {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let _ = tx.send(CoverState::Error(format!("Cover download: {}", e)));
+                        return;
+                    }
+                };
+                let mut reader = resp.into_body().into_reader();
+                let mut buf = Vec::new();
+                match std::io::Read::read_to_end(&mut reader, &mut buf) {
+                    Ok(_) => { let _ = tx.send(CoverState::Loaded(buf)); }
+                    Err(e) => { let _ = tx.send(CoverState::Error(format!("Cover read: {}", e))); }
+                }
+            });
+        }
+    }
+
+    fn decode_mb_cover(&mut self, _index: usize) {
+        if let MbState::Suggestions { cover_state, .. } = &self.mb_state {
+            if let CoverState::Loaded(data) = cover_state {
+                if let Ok(img) = image::load_from_memory(data) {
+                    if let Some(picker) = &self.picker {
+                        self.mb_cover_protocol = Some(picker.new_resize_protocol(img));
+                    }
+                }
+            }
+        }
+    }
+
+    fn load_mb_detail(&mut self, index: usize) {
+        if let MbState::Suggestions { results, .. } = &self.mb_state {
+            if index >= results.len() {
+                return;
+            }
+            let rid = results[index].release_id.clone();
+            if rid.is_empty() {
+                return;
+            }
+            let (tx, rx) = mpsc::channel();
+            self.detail_rx = Some(rx);
+            thread::spawn(move || {
+                let url = format!(
+                    "https://musicbrainz.org/ws/2/release/{}?fmt=json&inc=artist-credits+media+tags",
+                    rid
+                );
+                let config = ureq::Agent::config_builder()
+                    .user_agent("musictag/0.1.0 ( jpablo@example.com )")
+                    .build();
+                let agent = ureq::Agent::new_with_config(config);
+                let mut resp = match agent.get(&url).call() {
+                    Ok(r) => r,
+                    Err(_) => return,
+                };
+                let body: String = match resp.body_mut().read_to_string() {
+                    Ok(b) => b,
+                    Err(_) => return,
+                };
+                let detail: MbReleaseDetail = match serde_json::from_str(&body) {
+                    Ok(d) => d,
+                    Err(_) => return,
+                };
+                let albumartist = detail
+                    .artist_credit
+                    .map(|ac| {
+                        ac.into_iter()
+                            .map(|a| a.name)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .unwrap_or_default();
+                let disc = detail
+                    .media
+                    .map(|m| {
+                        m.iter()
+                            .filter_map(|md| md.position)
+                            .map(|p| p.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .unwrap_or_default();
+                let genre = detail
+                    .tags
+                    .map(|t| {
+                        t.into_iter()
+                            .map(|tag| tag.name)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .unwrap_or_default();
+                let sug = MbSuggestion {
+                    source: MbSource::Recording,
+                    title: String::new(),
+                    artist: String::new(),
+                    album: String::new(),
+                    albumartist,
+                    year: String::new(),
+                    disc,
+                    genre,
+                    comment: String::new(),
+                    release_id: String::new(),
+                    release_status: String::new(),
+                };
+                let _ = tx.send(sug);
+            });
+        }
+    }
+
+    fn navigate_mb(&mut self, delta: isize) {
+        if let MbState::Suggestions { results, index, cover_state } = &mut self.mb_state {
+            let len = results.len();
+            if len == 0 {
+                return;
+            }
+            let new_index = if delta < 0 {
+                index.saturating_sub(1)
+            } else {
+                (*index + 1).min(len.saturating_sub(1))
+            };
+            if new_index != *index {
+                *index = new_index;
+                *cover_state = CoverState::None;
+                self.mb_cover_protocol = None;
+                self.download_mb_cover(new_index);
+                self.load_mb_detail(new_index);
+            }
+        }
+    }
+
+    fn apply_mb_suggestion(&mut self) {
+        if let MbState::Suggestions { results, index, .. } = &self.mb_state {
+            if results.is_empty() {
+                return;
+            }
+            let s = &results[*index];
+            if self.edit_vals.len() < 9 {
+                return;
+            }
+            if !s.title.is_empty() {
+                self.edit_vals[0] = s.title.clone();
+            }
+            if !s.artist.is_empty() {
+                self.edit_vals[1] = s.artist.clone();
+            }
+            if !s.album.is_empty() {
+                self.edit_vals[2] = s.album.clone();
+            }
+            if !s.albumartist.is_empty() {
+                self.edit_vals[3] = s.albumartist.clone();
+            }
+            if !s.year.is_empty() {
+                self.edit_vals[4] = s.year.clone();
+            }
+            if !s.disc.is_empty() {
+                self.edit_vals[6] = s.disc.clone();
+            }
+            if !s.genre.is_empty() {
+                self.edit_vals[7] = s.genre.clone();
+            }
+            if !s.comment.is_empty() {
+                self.edit_vals[8] = s.comment.clone();
+            }
+            self.status_msg = format!("{} Sugerencia aplicada", icon::CHECK);
+            self.status_is_error = false;
         }
     }
 
@@ -967,7 +1346,12 @@ impl App {
     }
 
     fn enter_set_cover_art(&mut self) {
-        if self.current_idx < self.dir_entries.len() {
+        if !self.selected.is_empty() {
+            let has_files = self.selected.iter().any(|&idx| idx >= self.dir_entries.len());
+            if !has_files {
+                return;
+            }
+        } else if self.current_idx < self.dir_entries.len() {
             return;
         }
         self.cover_path.clear();
@@ -976,17 +1360,7 @@ impl App {
     }
 
     fn apply_cover_art(&mut self) -> bool {
-        if self.current_idx < self.dir_entries.len() {
-            return false;
-        }
-        let fidx = self.current_idx - self.dir_entries.len();
-        if fidx >= self.files.len() {
-            return false;
-        }
-
-        let filepath = &self.files[fidx];
         let img_path = Path::new(&self.cover_path);
-
         if !img_path.exists() {
             self.status_msg = match self.l.lang {
                 Lang::Es => format!("{} La imagen no existe", icon::CLOSE),
@@ -996,24 +1370,73 @@ impl App {
             return false;
         }
 
-        match set_cover_art(filepath, img_path) {
-            Ok(()) => {
-                let name = filepath.file_name().unwrap_or_default().to_string_lossy();
+        let indices: Vec<usize> = if !self.selected.is_empty() {
+            let mut v: Vec<usize> = self.selected.iter().copied().collect();
+            v.sort();
+            v
+        } else {
+            vec![self.current_idx]
+        };
+
+        let mut successes = 0u32;
+        let mut errors = 0u32;
+        let mut first_error = String::new();
+
+        for &idx in &indices {
+            let fidx = match idx.checked_sub(self.dir_entries.len()) {
+                Some(f) => f,
+                None => continue,
+            };
+            if fidx >= self.files.len() {
+                continue;
+            }
+            let filepath = &self.files[fidx];
+            match set_cover_art(filepath, img_path) {
+                Ok(()) => successes += 1,
+                Err(e) => {
+                    errors += 1;
+                    if first_error.is_empty() {
+                        first_error = e;
+                    }
+                }
+            }
+        }
+
+        if successes > 0 && errors == 0 {
+            if indices.len() > 1 {
+                self.status_msg = match self.l.lang {
+                    Lang::Es => format!("{} Portada asignada a {} archivos", icon::CHECK, successes),
+                    Lang::En => format!("{} Cover art set for {} files", icon::CHECK, successes),
+                };
+                self.selected.clear();
+            } else {
+                let idx = indices[0];
+                let fidx = idx - self.dir_entries.len();
+                let name = self.files[fidx]
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy();
                 self.status_msg = match self.l.lang {
                     Lang::Es => format!("{} Portada asignada: {}", icon::CHECK, name),
                     Lang::En => format!("{} Cover art set: {}", icon::CHECK, name),
                 };
-                self.status_is_error = false;
-                true
             }
-            Err(e) => {
-                self.status_msg = match self.l.lang {
-                    Lang::Es => format!("{} Error al asignar portada: {}", icon::CLOSE, e),
-                    Lang::En => format!("{} Cover art error: {}", icon::CLOSE, e),
-                };
-                self.status_is_error = true;
-                false
-            }
+            self.status_is_error = false;
+            true
+        } else if errors > 0 {
+            self.status_msg = match self.l.lang {
+                Lang::Es => format!("{} {} errores: {}", icon::CLOSE, errors, first_error),
+                Lang::En => format!("{} {} errors: {}", icon::CLOSE, errors, first_error),
+            };
+            self.status_is_error = true;
+            false
+        } else {
+            self.status_msg = match self.l.lang {
+                Lang::Es => format!("{} No hay archivos de audio seleccionados", icon::CLOSE),
+                Lang::En => format!("{} No audio files selected", icon::CLOSE),
+            };
+            self.status_is_error = true;
+            false
         }
     }
 
@@ -1118,6 +1541,25 @@ impl App {
                 };
                 self.status_is_error = false;
             }
+            KeyCode::Char('e') => {
+                if self.current_idx < self.dir_entries.len() {
+                    // directory, skip
+                } else {
+                    let fidx = self.current_idx - self.dir_entries.len();
+                    if let Some(fp) = self.files.get(fidx) {
+                        match extract_cover_from(fp) {
+                            Ok(path) => {
+                                self.status_msg = format!("{} Extraída: {}", icon::CHECK, path);
+                                self.status_is_error = false;
+                            }
+                            Err(e) => {
+                                self.status_msg = format!("{} {}", icon::CLOSE, e);
+                                self.status_is_error = true;
+                            }
+                        }
+                    }
+                }
+            }
             _ => {}
         }
         self.update_cover_state();
@@ -1203,6 +1645,11 @@ impl App {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.enter_edit_mode(true);
             }
+            KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.apply_mb_suggestion();
+            }
+            KeyCode::PageDown => self.navigate_mb(1),
+            KeyCode::PageUp => self.navigate_mb(-1),
             KeyCode::Char(c) => {
                 self.edit_vals[self.edit_idx].insert(self.edit_cursor, c);
                 self.edit_cursor += 1;
@@ -1282,6 +1729,18 @@ impl App {
         }
     }
 
+    fn cover_byte_idx(&self) -> usize {
+        self.cover_path
+            .char_indices()
+            .nth(self.cover_cursor)
+            .map(|(i, _)| i)
+            .unwrap_or(self.cover_path.len())
+    }
+
+    fn cover_char_count(&self) -> usize {
+        self.cover_path.chars().count()
+    }
+
     fn handle_cover_art_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Esc => {
@@ -1299,18 +1758,21 @@ impl App {
                 }
             }
             KeyCode::Char(c) => {
-                self.cover_path.insert(self.cover_cursor, c);
+                let byte_pos = self.cover_byte_idx();
+                self.cover_path.insert(byte_pos, c);
                 self.cover_cursor += 1;
             }
             KeyCode::Backspace => {
                 if self.cover_cursor > 0 {
                     self.cover_cursor -= 1;
-                    self.cover_path.remove(self.cover_cursor);
+                    let byte_pos = self.cover_byte_idx();
+                    self.cover_path.remove(byte_pos);
                 }
             }
             KeyCode::Delete => {
-                if self.cover_cursor < self.cover_path.len() {
-                    self.cover_path.remove(self.cover_cursor);
+                if self.cover_cursor < self.cover_char_count() {
+                    let byte_pos = self.cover_byte_idx();
+                    self.cover_path.remove(byte_pos);
                 }
             }
             KeyCode::Left => {
@@ -1319,7 +1781,7 @@ impl App {
                 }
             }
             KeyCode::Right => {
-                if self.cover_cursor < self.cover_path.len() {
+                if self.cover_cursor < self.cover_char_count() {
                     self.cover_cursor += 1;
                 }
             }
@@ -1327,7 +1789,7 @@ impl App {
                 self.cover_cursor = 0;
             }
             KeyCode::End => {
-                self.cover_cursor = self.cover_path.len();
+                self.cover_cursor = self.cover_char_count();
             }
             _ => {}
         }
@@ -1422,6 +1884,157 @@ fn set_cover_art(filepath: &Path, image_path: &Path) -> Result<(), String> {
         .map_err(|e| format!("Could not save: {}", e))?;
 
     Ok(())
+}
+
+fn extract_cover_from(filepath: &Path) -> Result<String, String> {
+    use std::fs;
+
+    let tagged_file =
+        read_from_path(filepath).map_err(|e| format!("Could not read: {}", e))?;
+    let tag = tagged_file
+        .primary_tag()
+        .or_else(|| tagged_file.first_tag())
+        .ok_or_else(|| "No tag".to_string())?;
+    let picture = tag
+        .pictures()
+        .first()
+        .ok_or_else(|| "Sin portada".to_string())?;
+    let data = picture.data();
+    if data.is_empty() {
+        return Err("Portada vacía".to_string());
+    }
+    let fmt = image::guess_format(data).map_err(|e| format!("Formato: {}", e))?;
+    let ext = fmt.extensions_str()[0];
+    let stem = filepath.file_stem().unwrap_or_default();
+    let out_path = filepath.with_file_name(format!("{}.{}", stem.to_string_lossy(), ext));
+    fs::write(&out_path, data).map_err(|e| format!("No se pudo escribir: {}", e))?;
+    Ok(out_path.to_string_lossy().to_string())
+}
+
+fn query_musicbrainz(title: &str, artist: &str, album: &str) -> MbState {
+    let enc = |s: &str| s.replace(' ', "%20").replace('&', "%26");
+
+    let config = ureq::Agent::config_builder()
+        .user_agent("musictag/0.1.0 ( jpablo@example.com )")
+        .build();
+
+    let mut results: Vec<MbSuggestion> = Vec::new();
+
+    // 1) Search recordings by title + artist + album
+    if !title.is_empty() {
+        let mut parts: Vec<String> = Vec::new();
+        parts.push(format!("recording:{}", enc(title)));
+        if !artist.is_empty() {
+            parts.push(format!("artist:{}", enc(artist)));
+        }
+        if !album.is_empty() {
+            parts.push(format!("release:{}", enc(album)));
+        }
+        let rec_url = format!(
+            "https://musicbrainz.org/ws/2/recording/?query={}&fmt=json&limit=10",
+            parts.join("%20AND%20"),
+        );
+        let agent = ureq::Agent::new_with_config(config.clone());
+        if let Ok(mut resp) = agent.get(&rec_url).call() {
+            if let Ok(body) = resp.body_mut().read_to_string() {
+                if let Ok(mb) = serde_json::from_str::<MbResponse>(&body) {
+                    for rec in mb.recordings {
+                        let artist_str = rec
+                            .artist_credit
+                            .into_iter()
+                            .map(|a| a.name)
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let releases = rec.releases.unwrap_or_default();
+                        if releases.is_empty() {
+                            results.push(MbSuggestion {
+                                source: MbSource::Recording,
+                                title: rec.title,
+                                artist: artist_str.clone(),
+                                album: String::new(),
+                                albumartist: String::new(),
+                                year: String::new(),
+                                disc: String::new(),
+                                genre: String::new(),
+                                comment: String::new(),
+                                release_id: String::new(),
+                                release_status: String::new(),
+                            });
+                        } else {
+                            for rel in releases {
+                                results.push(MbSuggestion {
+                                    source: MbSource::Recording,
+                                    title: rec.title.clone(),
+                                    artist: artist_str.clone(),
+                                    album: rel.title,
+                                    albumartist: String::new(),
+                                    year: rel.date.unwrap_or_default(),
+                                    disc: String::new(),
+                                    genre: String::new(),
+                                    comment: String::new(),
+                                    release_id: rel.id,
+                                    release_status: rel.status.unwrap_or_default(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 2) Search releases by album (+ artist if available)
+    if !album.is_empty() {
+        let mut parts: Vec<String> = vec![format!("release:{}", enc(album))];
+        if !artist.is_empty() {
+            parts.push(format!("artist:{}", enc(artist)));
+        }
+        let rel_url = format!(
+            "https://musicbrainz.org/ws/2/release/?query={}&fmt=json&limit=10",
+            parts.join("%20AND%20"),
+        );
+        let agent = ureq::Agent::new_with_config(config);
+        if let Ok(mut resp) = agent.get(&rel_url).call() {
+            if let Ok(body) = resp.body_mut().read_to_string() {
+                if let Ok(mb) = serde_json::from_str::<MbReleaseSearchResponse>(&body) {
+                    for rel in mb.releases {
+                        let artist_str = rel
+                            .artist_credit
+                            .map(|ac| {
+                                ac.into_iter()
+                                    .map(|a| a.name)
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            })
+                            .unwrap_or_default();
+                        results.push(MbSuggestion {
+                            source: MbSource::Release,
+                            title: String::new(),
+                            artist: artist_str,
+                            album: rel.title,
+                            albumartist: String::new(),
+                            year: rel.date.unwrap_or_default(),
+                            disc: String::new(),
+                            genre: String::new(),
+                            comment: String::new(),
+                            release_id: rel.id,
+                            release_status: rel.status.unwrap_or_default(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    if results.is_empty() {
+        return MbState::Error("Sin resultados".into());
+    }
+
+    MbState::Suggestions {
+        results,
+        index: 0,
+        cover_state: CoverState::None,
+    }
 }
 
 fn ui(frame: &mut Frame, app: &mut App) {
@@ -1591,7 +2204,7 @@ fn render_browse(frame: &mut Frame, app: &mut App, chunks: &[Rect]) {
     }
 }
 
-fn render_edit(frame: &mut Frame, app: &App, chunks: &[Rect]) {
+fn render_edit(frame: &mut Frame, app: &mut App, chunks: &[Rect]) {
     let title_text = if app.batch_mode {
         app.l.edit_batch(app.batch_indices.len())
     } else {
@@ -1619,66 +2232,216 @@ fn render_edit(frame: &mut Frame, app: &App, chunks: &[Rect]) {
         .alignment(ratatui::layout::Alignment::Center);
     frame.render_widget(help_para, chunks[1]);
 
-    let fields = app.get_fields();
-    let mut lines: Vec<Line> = Vec::new();
+    let field_count = app.get_fields().len();
+    let form_widget = {
+        let fields = app.get_fields();
+        let mut lines: Vec<Line> = Vec::new();
 
-    for (i, (_key, label)) in fields.iter().enumerate() {
-        let val = &app.edit_vals[i];
-        let is_active = i == app.edit_idx;
+        for (i, (_key, label)) in fields.iter().enumerate() {
+            let val = &app.edit_vals[i];
+            let is_active = i == app.edit_idx;
 
-        let arrow = if is_active {
-            icon::ARROW_RIGHT
-        } else {
-            " "
-        };
-
-        let label_span = Span::styled(
-            format!("  {} {:<22}", arrow, label),
-            if is_active {
-                Style::default()
-                    .fg(app.colors.active_label_fg)
-                    .bg(app.colors.active_label_bg)
-                    .add_modifier(Modifier::BOLD)
+            let arrow = if is_active {
+                icon::ARROW_RIGHT
             } else {
+                " "
+            };
+
+            let label_span = Span::styled(
+                format!("  {:<1} {:<22}", arrow, label),
+                if is_active {
+                    Style::default()
+                        .fg(app.colors.active_label_fg)
+                        .bg(app.colors.active_label_bg)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                        .fg(app.colors.inactive_label)
+                        .add_modifier(Modifier::BOLD)
+                },
+            );
+
+            let val_display = if val.is_empty() {
+                app.l.val_empty().to_string()
+            } else {
+                val.clone()
+            };
+
+            let val_style = if is_active {
                 Style::default()
-                    .fg(app.colors.inactive_label)
+                    .fg(app.colors.active_value_fg)
+                    .bg(app.colors.active_value_bg)
                     .add_modifier(Modifier::BOLD)
-            },
-        );
+            } else if val.is_empty() {
+                Style::default()
+                    .fg(app.colors.empty_value)
+                    .add_modifier(Modifier::ITALIC)
+            } else {
+                Style::default().fg(app.colors.filled_value)
+            };
 
-        let val_display = if val.is_empty() {
-            app.l.val_empty().to_string()
-        } else {
-            val.clone()
-        };
+            let val_span = Span::styled(val_display, val_style);
 
-        let val_style = if is_active {
-            Style::default()
-                .fg(app.colors.active_value_fg)
-                .bg(app.colors.active_value_bg)
-                .add_modifier(Modifier::BOLD)
-        } else if val.is_empty() {
-            Style::default()
-                .fg(app.colors.empty_value)
-                .add_modifier(Modifier::ITALIC)
-        } else {
-            Style::default().fg(app.colors.filled_value)
-        };
+            lines.push(Line::from(vec![label_span, val_span]));
+        }
 
-        let val_span = Span::styled(val_display, val_style);
+        Paragraph::new(lines).wrap(Wrap { trim: false })
+    };
 
-        lines.push(Line::from(vec![label_span, val_span]));
+    let form_line_count = field_count as u16 + 1;
+
+    let edit_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(chunks[3]);
+
+    // Left panel: local form + local cover
+    let (left_top, left_bottom) = {
+        let c = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(form_line_count), Constraint::Min(3)])
+            .split(edit_chunks[0]);
+        (c[0], c[1])
+    };
+
+    let left_block = Block::default()
+        .borders(Borders::NONE);
+    let left_area = left_block.inner(left_top);
+    frame.render_widget(left_block, left_top);
+    frame.render_widget(form_widget, left_area);
+
+    // Local cover image in left bottom
+    if left_bottom.height >= 2 && left_bottom.width >= 4 {
+        if let Some(protocol) = &mut app.cover_protocol {
+            frame.render_widget(Clear, left_bottom);
+            let image: StatefulImage<StatefulProtocol> = StatefulImage::default().resize(Resize::Fit(None));
+            frame.render_stateful_widget(image, left_bottom, protocol);
+        }
     }
 
-    let form_widget = Paragraph::new(lines).wrap(Wrap { trim: false });
-    frame.render_widget(form_widget, chunks[3]);
+    // Right panel: MB metadata + MB cover
+    let (right_top, right_bottom) = {
+        let c = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(12), Constraint::Min(3)])
+            .split(edit_chunks[1]);
+        (c[0], c[1])
+    };
+
+    let mb_lines: Vec<Line> = match &app.mb_state {
+        MbState::Idle | MbState::LoadingSuggestions => {
+            vec![Line::from(Span::styled(
+                "  Buscando...",
+                Style::default().fg(app.colors.empty_value),
+            ))]
+        }
+        MbState::Suggestions { results, index, cover_state } => {
+            let mut v = Vec::new();
+            let s = &results[*index];
+
+            let source_label = match s.source {
+                MbSource::Recording => "Tema",
+                MbSource::Release => "Álbum",
+            };
+            let year_short: String = s.year.chars().take(4).collect();
+            let tag = if !s.release_status.is_empty() && !year_short.is_empty() {
+                format!("{} · {} · {}", source_label, s.release_status, year_short)
+            } else if !s.release_status.is_empty() {
+                format!("{} · {}", source_label, s.release_status)
+            } else if !year_short.is_empty() {
+                format!("{} · {}", source_label, year_short)
+            } else {
+                source_label.to_string()
+            };
+            let nav = format!(" {}/{}  [{}]  Ctrl+G:aplicar", index + 1, results.len(), tag);
+            v.push(Line::from(Span::styled(
+                nav,
+                Style::default().fg(app.colors.metadata_label).add_modifier(Modifier::BOLD),
+            )));
+            v.push(Line::from(""));
+
+            let fields: Vec<(&str, &str)> = vec![
+                ("  Título: ", &s.title),
+                ("  Artista: ", &s.artist),
+                ("  Álbum: ", &s.album),
+                ("  Artista Álbum: ", &s.albumartist),
+                ("  Año: ", &s.year),
+                ("  Disco: ", &s.disc),
+                ("  Género: ", &s.genre),
+                ("  Comentario: ", &s.comment),
+            ];
+
+            for (label, val) in &fields {
+                if !val.is_empty() {
+                    v.push(Line::from(vec![
+                        Span::styled(*label, Style::default().fg(app.colors.metadata_label).add_modifier(Modifier::BOLD)),
+                        Span::styled(val.to_string(), Style::default().fg(app.colors.metadata_value)),
+                    ]));
+                } else {
+                    v.push(Line::from(vec![
+                        Span::styled(*label, Style::default().fg(app.colors.metadata_label).add_modifier(Modifier::BOLD)),
+                        Span::styled("—", Style::default().fg(app.colors.empty_value)),
+                    ]));
+                }
+            }
+
+            match cover_state {
+                CoverState::Loading => {
+                    v.push(Line::from(""));
+                    v.push(Line::from(Span::styled(
+                        "  Descargando carátula...",
+                        Style::default().fg(app.colors.empty_value),
+                    )));
+                }
+                CoverState::Error(e) => {
+                    v.push(Line::from(""));
+                    v.push(Line::from(Span::styled(
+                        format!("  {}", e),
+                        Style::default().fg(app.colors.error),
+                    )));
+                }
+                _ => {}
+            }
+
+            if v.len() <= 2 {
+                v.push(Line::from(Span::styled(
+                    "  Sin datos",
+                    Style::default().fg(app.colors.empty_value),
+                )));
+            }
+
+            v
+        }
+        MbState::Error(e) => {
+            vec![Line::from(Span::styled(
+                format!("  Error: {}", e),
+                Style::default().fg(app.colors.error),
+            ))]
+        }
+    };
+
+    let mb_para = Paragraph::new(mb_lines).wrap(Wrap { trim: false });
+    frame.render_widget(mb_para, right_top);
+
+    // MB cover image in right bottom
+    if right_bottom.height >= 2 && right_bottom.width >= 4 {
+        if let MbState::Suggestions { cover_state, .. } = &app.mb_state {
+            if matches!(cover_state, CoverState::Loaded(_)) {
+                if let Some(protocol) = &mut app.mb_cover_protocol {
+                    frame.render_widget(Clear, right_bottom);
+                    let image: StatefulImage<StatefulProtocol> = StatefulImage::default().resize(Resize::Fit(None));
+                    frame.render_stateful_widget(image, right_bottom, protocol);
+                }
+            }
+        }
+    }
 
     let status_style = Style::default()
         .fg(app.colors.info)
         .add_modifier(Modifier::DIM);
     let status = Paragraph::new(app.l.status_field(
         app.edit_idx + 1,
-        fields.len(),
+        field_count,
         app.edit_cursor,
     ))
     .style(status_style)
@@ -1939,7 +2702,11 @@ fn render_delete_confirm(frame: &mut Frame, app: &App) {
 fn render_cover_art_popup(frame: &mut Frame, app: &App) {
     let area = frame.area();
 
-    let title = app.l.cover_title();
+    let title = if app.selected.is_empty() {
+        app.l.cover_title()
+    } else {
+        app.l.cover_batch_title(app.selected.len())
+    };
     let hint = app.l.cover_hint();
 
     let popup_width = (60).min(area.width.saturating_sub(4));
@@ -1959,7 +2726,13 @@ fn render_cover_art_popup(frame: &mut Frame, app: &App) {
 
     let input_width = inner.width as usize;
     let display_path = if app.cover_path.len() > input_width.saturating_sub(2) {
-        let start = app.cover_path.len().saturating_sub(input_width.saturating_sub(2));
+        let target = app.cover_path.len().saturating_sub(input_width.saturating_sub(2));
+        let start = app.cover_path
+            .char_indices()
+            .map(|(i, _)| i)
+            .filter(|&i| i >= target)
+            .next()
+            .unwrap_or(app.cover_path.len());
         format!("...{}", &app.cover_path[start..])
     } else {
         app.cover_path.clone()
@@ -2032,6 +2805,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     app.update_cover_state();
 
     loop {
+        app.check_mb_results();
         terminal.draw(|f| ui(f, &mut app))?;
 
         if let Event::Key(key) = event::read()? {
