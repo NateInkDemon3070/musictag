@@ -1,10 +1,14 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
 
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent,
+        KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -20,7 +24,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
     Frame, Terminal,
 };
 use ratatui_image::{picker::Picker, protocol::StatefulProtocol, Resize, StatefulImage};
@@ -210,24 +214,104 @@ impl ColorScheme {
             metadata_value: Color::Rgb(0xcd, 0xd6, 0xf4),
         }
     }
+
+    fn set(&mut self, key: &str, value: &str) {
+        let Some(c) = parse_hex_color(value) else {
+            return;
+        };
+        match key {
+            "background" => self.background = c,
+            "foreground" => self.foreground = c,
+            "header_bg" => self.header_bg = c,
+            "header_fg" => self.header_fg = c,
+            "dir_path" => self.dir_path = c,
+            "help_text" => self.help_text = c,
+            "folder" => self.folder = c,
+            "selected" => self.selected = c,
+            "normal_file" => self.normal_file = c,
+            "highlight_bg" => self.highlight_bg = c,
+            "highlight_fg" => self.highlight_fg = c,
+            "info" => self.info = c,
+            "error" => self.error = c,
+            "success" => self.success = c,
+            "edit_batch" => self.edit_batch = c,
+            "edit_individual" => self.edit_individual = c,
+            "active_label_bg" => self.active_label_bg = c,
+            "active_label_fg" => self.active_label_fg = c,
+            "inactive_label" => self.inactive_label = c,
+            "active_value_bg" => self.active_value_bg = c,
+            "active_value_fg" => self.active_value_fg = c,
+            "empty_value" => self.empty_value = c,
+            "filled_value" => self.filled_value = c,
+            "preview_border" => self.preview_border = c,
+            "filter_border" => self.filter_border = c,
+            "delete_border" => self.delete_border = c,
+            "cover_border" => self.cover_border = c,
+            "input_border" => self.input_border = c,
+            "metadata_label" => self.metadata_label = c,
+            "metadata_value" => self.metadata_value = c,
+            _ => {}
+        }
+    }
 }
 
-fn config_path() -> PathBuf {
+fn parse_hex_color(s: &str) -> Option<Color> {
+    let s = s.trim().trim_start_matches('#').trim_start_matches("0x");
+    if s.len() != 6 {
+        return None;
+    }
+    let r = u8::from_str_radix(&s[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&s[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&s[4..6], 16).ok()?;
+    Some(Color::Rgb(r, g, b))
+}
+
+fn config_dir() -> PathBuf {
     dirs::config_dir()
         .unwrap_or_else(|| dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")))
         .join("musictag")
-        .join("config")
 }
 
-fn load_config() -> (Option<PathBuf>, bool) {
+fn config_path() -> PathBuf {
+    config_dir().join("config")
+}
+
+fn covers_dir() -> PathBuf {
+    config_dir().join("covers")
+}
+
+struct Config {
+    dir: Option<PathBuf>,
+    show_preview: bool,
+    nav: NavScheme,
+    colors: ColorScheme,
+    custom_keys: HashMap<Action, Vec<KeySpec>>,
+    border: BorderStyle,
+    border_overrides: HashMap<String, BorderStyle>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Config {
+            dir: None,
+            show_preview: true,
+            nav: NavScheme::default(),
+            colors: ColorScheme::default(),
+            custom_keys: HashMap::new(),
+            border: BorderStyle::default(),
+            border_overrides: HashMap::new(),
+        }
+    }
+}
+
+fn load_config() -> Config {
     let path = config_path();
     let content = match fs::read_to_string(&path) {
         Ok(c) => c,
-        Err(_) => return (None, true),
+        Err(_) => return Config::default(),
     };
 
-    let mut dir: Option<PathBuf> = None;
-    let mut show_preview = true;
+    let mut config = Config::default();
 
     for line in content.lines() {
         let line = line.trim();
@@ -235,42 +319,147 @@ fn load_config() -> (Option<PathBuf>, bool) {
             continue;
         }
         if let Some((key, value)) = line.split_once('=') {
-            match key.trim() {
+            let key = key.trim();
+            let value = value.trim();
+            match key {
                 "default_dir" => {
-                    let p = PathBuf::from(value.trim());
+                    let p = PathBuf::from(value);
                     if p.exists() && p.is_dir() {
-                        dir = Some(p);
+                        config.dir = Some(p);
                     }
                 }
                 "show_preview" => {
-                    show_preview = value.trim() != "false";
+                    config.show_preview = value != "false";
                 }
-                _ => {}
+                "nav" => {
+                    config.nav = NavScheme::parse(value);
+                }
+                "border" => {
+                    config.border = BorderStyle::parse(value);
+                }
+                _ => {
+                    if let Some(color_key) = key.strip_prefix("color.") {
+                        config.colors.set(color_key, value);
+                    } else if let Some(action_key) = key.strip_prefix("key.") {
+                        if let Some(action) = Action::from_name(action_key) {
+                            let keys: Vec<KeySpec> = value
+                                .split(',')
+                                .filter_map(|p| KeySpec::parse(p.trim()))
+                                .collect();
+                            config.custom_keys.insert(action, keys);
+                        }
+                    } else if let Some(border_key) = key.strip_prefix("border.") {
+                        config.border_overrides.insert(
+                            border_key.trim().to_string(),
+                            BorderStyle::parse(value),
+                        );
+                    }
+                }
             }
-        } else if dir.is_none() {
+        } else if config.dir.is_none() {
             let p = PathBuf::from(line);
             if p.exists() && p.is_dir() {
-                dir = Some(p);
+                config.dir = Some(p);
             }
         }
     }
 
-    (dir, show_preview)
+    config
 }
 
-fn save_config(dir: &Path, show_preview: bool) -> Result<(), String> {
+fn color_hex(c: Color) -> String {
+    match c {
+        Color::Rgb(r, g, b) => format!("#{:02x}{:02x}{:02x}", r, g, b),
+        _ => String::new(),
+    }
+}
+
+fn example_theme_block() -> String {
+    let c = ColorScheme::catppuccin_mocha();
+    let color_lines = [
+        ("background", c.background),
+        ("foreground", c.foreground),
+        ("header_bg", c.header_bg),
+        ("header_fg", c.header_fg),
+        ("dir_path", c.dir_path),
+        ("help_text", c.help_text),
+        ("folder", c.folder),
+        ("selected", c.selected),
+        ("normal_file", c.normal_file),
+        ("highlight_bg", c.highlight_bg),
+        ("highlight_fg", c.highlight_fg),
+        ("info", c.info),
+        ("error", c.error),
+        ("success", c.success),
+        ("edit_batch", c.edit_batch),
+        ("edit_individual", c.edit_individual),
+        ("active_label_bg", c.active_label_bg),
+        ("active_label_fg", c.active_label_fg),
+        ("inactive_label", c.inactive_label),
+        ("active_value_bg", c.active_value_bg),
+        ("active_value_fg", c.active_value_fg),
+        ("empty_value", c.empty_value),
+        ("filled_value", c.filled_value),
+        ("preview_border", c.preview_border),
+        ("filter_border", c.filter_border),
+        ("delete_border", c.delete_border),
+        ("cover_border", c.cover_border),
+        ("input_border", c.input_border),
+        ("metadata_label", c.metadata_label),
+        ("metadata_value", c.metadata_value),
+    ];
+
+    let mut out = String::from(
+        "\n# ==== Tema de ejemplo (Catppuccin Mocha) ====\n\
+         # Descomenta una línea para cambiar ese color.\n",
+    );
+    for (key, color) in color_lines {
+        out.push_str(&format!("# color.{}={}\n", key, color_hex(color)));
+    }
+    out.push_str(
+        "\n# ==== Bordes (single, rounded, double, thick, none) ====\n\
+         # border=rounded\n\
+         # border.preview=double\n\
+         # border.filter=rounded\n\
+         # border.delete=double\n\
+         # border.cover=rounded\n\
+         # border.input=single\n",
+    );
+    out
+}
+
+fn save_config(dir: &Path, show_preview: bool, nav: NavScheme) -> Result<String, String> {
     let path = config_path();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("Could not create config dir: {}", e))?;
     }
-    let content = format!(
-        "default_dir={}\nshow_preview={}\n",
+    let mut extras: Vec<String> = Vec::new();
+    if let Ok(content) = fs::read_to_string(&path) {
+        for line in content.lines() {
+            let t = line.trim_start();
+            if t.starts_with("color.")
+                || t.starts_with("key.")
+                || t.starts_with("border.")
+                || t == "border"
+            {
+                extras.push(line.to_string());
+            }
+        }
+    }
+    let mut content = format!(
+        "default_dir={}\nshow_preview={}\nnav={}\n",
         dir.display(),
-        show_preview
+        show_preview,
+        nav.name()
     );
+    for e in extras {
+        content.push_str(&e);
+        content.push('\n');
+    }
+    content.push_str(&example_theme_block());
     fs::write(&path, content.as_bytes())
         .map_err(|e| format!("Could not save config: {}", e))?;
-    Ok(())
+    Ok(content)
 }
 
 mod icon {
@@ -279,15 +468,12 @@ mod icon {
     pub const CLOSE: &str = "\u{f00d}";
     pub const EDIT: &str = "\u{f303}";
     pub const SEARCH: &str = "\u{f002}";
-    pub const ARROW_DOWN: &str = "\u{f078}";
-    pub const ARROW_UP: &str = "\u{f077}";
     pub const DISK: &str = "\u{f7c2}";
     pub const FILTER: &str = "\u{f0b0}";
     pub const MUSIC_FILE: &str = "\u{f1c6}";
     pub const TAG: &str = "\u{f02c}";
     pub const SELECT: &str = "\u{f14a}";
     pub const TRASH: &str = "\u{f2ed}";
-    pub const ARROW_LEFT: &str = "\u{f053}";
     pub const ARROW_RIGHT: &str = "\u{f054}";
     pub const WARNING: &str = "\u{f071}";
     pub const BULK: &str = "\u{f0c3}";
@@ -407,22 +593,88 @@ impl L {
         }
     }
 
-    fn help_browse(&self) -> String {
+    fn help_browse(&self, km: &Keymap) -> String {
+        let first = |a: Action| {
+            km.keys_for(a, false)
+                .first()
+                .map(|k| k.label())
+                .unwrap_or_default()
+        };
         match self.lang {
-            Lang::Es => " j/k:mover  l/Enter:abrir  espacio:seleccionar  v:seleccionar todo  a:editar seleccion  x:eliminar  c:portada  e:extraer  P:preview  C:predeterminada  q:salir".into(),
-            Lang::En => " j/k:move  l/Enter:open  space:select  v:select all  a:edit selected  x:delete  c:cover  e:extract  P:preview  C:default  q:quit".into(),
+            Lang::Es => format!(
+                " {}/{}:mover  {}:abrir  {}:seleccionar  {}:todo  {}:editar  {}:eliminar  {}:portada  {}:extraer  {}:filtrar  {}:teclas  {}:preview  {}:cfg  {}:ayuda  {}:salir",
+                first(Action::Up),
+                first(Action::Down),
+                first(Action::Right),
+                first(Action::ToggleSelect),
+                first(Action::ApplySelected),
+                first(Action::ApplyAll),
+                first(Action::Delete),
+                first(Action::SetCoverArt),
+                first(Action::ExtractCover),
+                first(Action::Filter),
+                first(Action::ToggleNav),
+                first(Action::TogglePreview),
+                first(Action::SaveConfig),
+                first(Action::ToggleHelp),
+                first(Action::Quit),
+            ),
+            Lang::En => format!(
+                " {}/{}:move  {}:open  {}:select  {}:all  {}:edit  {}:delete  {}:cover  {}:extract  {}:filter  {}:keys  {}:preview  {}:cfg  {}:help  {}:quit",
+                first(Action::Up),
+                first(Action::Down),
+                first(Action::Right),
+                first(Action::ToggleSelect),
+                first(Action::ApplySelected),
+                first(Action::ApplyAll),
+                first(Action::Delete),
+                first(Action::SetCoverArt),
+                first(Action::ExtractCover),
+                first(Action::Filter),
+                first(Action::ToggleNav),
+                first(Action::TogglePreview),
+                first(Action::SaveConfig),
+                first(Action::ToggleHelp),
+                first(Action::Quit),
+            ),
         }
     }
 
-    fn help_edit(&self) -> String {
+    fn help_edit(&self, km: &Keymap) -> String {
+        let first = |a: Action| {
+            km.keys_for(a, true)
+                .first()
+                .map(|k| k.label())
+                .unwrap_or_default()
+        };
         match self.lang {
             Lang::Es => format!(
-                "{}{} campo  {}{} cursor  Ctrl+G:aplicar MB  Re/Av Pág:navegar MB  Enter:guardar  Esc:cancelar  Ctrl+S:guardar y avanzar",
-                icon::ARROW_UP, icon::ARROW_DOWN, icon::ARROW_LEFT, icon::ARROW_RIGHT,
+                " {}/{}:campo  {}/{}:cursor  {}:aplicar MB  {}/{}:MB nav  {}:MB navegador  {}:guardar  {}:cancelar  {}:guardar y avanzar",
+                first(Action::Up),
+                first(Action::Down),
+                first(Action::Left),
+                first(Action::Right),
+                first(Action::ApplyMb),
+                first(Action::MbPrev),
+                first(Action::MbNext),
+                first(Action::MbBrowser),
+                first(Action::Enter),
+                first(Action::Escape),
+                first(Action::SaveNext),
             ),
             Lang::En => format!(
-                "{}{} field  {}{} cursor  Ctrl+G:apply MB  PgUp/PgDn:MB nav  Enter:save  Esc:cancel  Ctrl+S:save & next",
-                icon::ARROW_UP, icon::ARROW_DOWN, icon::ARROW_LEFT, icon::ARROW_RIGHT,
+                " {}/{}:field  {}/{}:cursor  {}:apply MB  {}/{}:MB nav  {}:MB browser  {}:save  {}:cancel  {}:save & next",
+                first(Action::Up),
+                first(Action::Down),
+                first(Action::Left),
+                first(Action::Right),
+                first(Action::ApplyMb),
+                first(Action::MbPrev),
+                first(Action::MbNext),
+                first(Action::MbBrowser),
+                first(Action::Enter),
+                first(Action::Escape),
+                first(Action::SaveNext),
             ),
         }
     }
@@ -466,6 +718,34 @@ impl L {
         match self.lang {
             Lang::Es => format!("{} Recargado", icon::CHECK),
             Lang::En => format!("{} Reloaded", icon::CHECK),
+        }
+    }
+
+    fn help_shown(&self) -> String {
+        match self.lang {
+            Lang::Es => format!("{} Ayuda visible", icon::CHECK),
+            Lang::En => format!("{} Help shown", icon::CHECK),
+        }
+    }
+
+    fn help_hidden(&self) -> String {
+        match self.lang {
+            Lang::Es => format!("{} Ayuda oculta", icon::CHECK),
+            Lang::En => format!("{} Help hidden", icon::CHECK),
+        }
+    }
+
+    fn nav_vim(&self) -> String {
+        match self.lang {
+            Lang::Es => format!("{} Teclas vim activadas", icon::CHECK),
+            Lang::En => format!("{} Vim keys enabled", icon::CHECK),
+        }
+    }
+
+    fn nav_arrows(&self) -> String {
+        match self.lang {
+            Lang::Es => format!("{} Teclas de flechas activadas", icon::CHECK),
+            Lang::En => format!("{} Arrow keys enabled", icon::CHECK),
         }
     }
 
@@ -613,6 +893,13 @@ impl L {
         }
     }
 
+    fn config_reloaded(&self) -> String {
+        match self.lang {
+            Lang::Es => format!("{} Config recargado", icon::CHECK),
+            Lang::En => format!("{} Config reloaded", icon::CHECK),
+        }
+    }
+
     fn config_error(&self, e: &str) -> String {
         match self.lang {
             Lang::Es => format!("{} Error al guardar configuracion: {}", icon::CLOSE, e),
@@ -702,6 +989,360 @@ enum AppMode {
     SetCoverArt,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BorderStyle {
+    Single,
+    Rounded,
+    Double,
+    Thick,
+    None,
+}
+
+impl BorderStyle {
+    fn parse(s: &str) -> Self {
+        match s.trim().to_lowercase().as_str() {
+            "rounded" | "redondeado" => BorderStyle::Rounded,
+            "double" | "doble" => BorderStyle::Double,
+            "thick" | "grueso" => BorderStyle::Thick,
+            "none" | "ninguno" | "off" => BorderStyle::None,
+            _ => BorderStyle::Single,
+        }
+    }
+
+    fn border_type(&self) -> BorderType {
+        match self {
+            BorderStyle::Single => BorderType::Plain,
+            BorderStyle::Rounded => BorderType::Rounded,
+            BorderStyle::Double => BorderType::Double,
+            BorderStyle::Thick => BorderType::Thick,
+            BorderStyle::None => BorderType::Plain,
+        }
+    }
+}
+
+impl Default for BorderStyle {
+    fn default() -> Self {
+        BorderStyle::Single
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum NavScheme {
+    Vim,
+    Arrows,
+}
+
+impl NavScheme {
+    fn parse(s: &str) -> Self {
+        match s.trim() {
+            "arrows" => NavScheme::Arrows,
+            _ => NavScheme::Vim,
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        match self {
+            NavScheme::Vim => "vim",
+            NavScheme::Arrows => "arrows",
+        }
+    }
+}
+
+impl Default for NavScheme {
+    fn default() -> Self {
+        NavScheme::Vim
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum KeySpec {
+    Char(char),
+    Ctrl(char),
+    Enter,
+    Esc,
+    Tab,
+    BackTab,
+    Backspace,
+    Delete,
+    Up,
+    Down,
+    Left,
+    Right,
+    Home,
+    End,
+    PageUp,
+    PageDown,
+}
+
+impl KeySpec {
+    fn parse(s: &str) -> Option<Self> {
+        let s = s.trim();
+        if let Some(c) = s.strip_prefix("ctrl+") {
+            let mut it = c.chars();
+            let ch = it.next()?;
+            if it.next().is_some() {
+                return None;
+            }
+            return Some(KeySpec::Ctrl(ch));
+        }
+        match s.to_lowercase().as_str() {
+            "enter" | "return" => Some(KeySpec::Enter),
+            "esc" | "escape" => Some(KeySpec::Esc),
+            "tab" => Some(KeySpec::Tab),
+            "backtab" | "shift-tab" => Some(KeySpec::BackTab),
+            "backspace" | "bs" | "retroceso" => Some(KeySpec::Backspace),
+            "delete" | "del" | "supr" | "suprimir" => Some(KeySpec::Delete),
+            "up" | "arriba" => Some(KeySpec::Up),
+            "down" | "abajo" => Some(KeySpec::Down),
+            "left" | "izquierda" => Some(KeySpec::Left),
+            "right" | "derecha" => Some(KeySpec::Right),
+            "home" | "inicio" => Some(KeySpec::Home),
+            "end" | "fin" => Some(KeySpec::End),
+            "pageup" | "pgup" => Some(KeySpec::PageUp),
+            "pagedown" | "pgdn" => Some(KeySpec::PageDown),
+            "space" | "espacio" => Some(KeySpec::Char(' ')),
+            _ => {
+                let mut it = s.chars();
+                let ch = it.next()?;
+                if it.next().is_some() {
+                    None
+                } else {
+                    Some(KeySpec::Char(ch))
+                }
+            }
+        }
+    }
+
+    fn matches(&self, key: &KeyEvent) -> bool {
+        match self {
+            KeySpec::Char(c) => {
+                let mods = key.modifiers.bits() & !KeyModifiers::SHIFT.bits();
+                mods == 0 && key.code == KeyCode::Char(*c)
+            }
+            KeySpec::Ctrl(c) => {
+                key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT)
+                    && key.code == KeyCode::Char(*c)
+            }
+            KeySpec::Enter => key.code == KeyCode::Enter,
+            KeySpec::Esc => key.code == KeyCode::Esc,
+            KeySpec::Tab => key.code == KeyCode::Tab,
+            KeySpec::BackTab => key.code == KeyCode::BackTab,
+            KeySpec::Backspace => key.code == KeyCode::Backspace,
+            KeySpec::Delete => key.code == KeyCode::Delete,
+            KeySpec::Up => key.code == KeyCode::Up,
+            KeySpec::Down => key.code == KeyCode::Down,
+            KeySpec::Left => key.code == KeyCode::Left,
+            KeySpec::Right => key.code == KeyCode::Right,
+            KeySpec::Home => key.code == KeyCode::Home,
+            KeySpec::End => key.code == KeyCode::End,
+            KeySpec::PageUp => key.code == KeyCode::PageUp,
+            KeySpec::PageDown => key.code == KeyCode::PageDown,
+        }
+    }
+
+    fn label(&self) -> String {
+        match self {
+            KeySpec::Char(c) => c.to_string(),
+            KeySpec::Ctrl(c) => format!("Ctrl+{}", c.to_uppercase()),
+            KeySpec::Enter => "Enter".into(),
+            KeySpec::Esc => "Esc".into(),
+            KeySpec::Tab => "Tab".into(),
+            KeySpec::BackTab => "Shift+Tab".into(),
+            KeySpec::Backspace => "Retr".into(),
+            KeySpec::Delete => "Supr".into(),
+            KeySpec::Up => "↑".into(),
+            KeySpec::Down => "↓".into(),
+            KeySpec::Left => "←".into(),
+            KeySpec::Right => "→".into(),
+            KeySpec::Home => "Inicio".into(),
+            KeySpec::End => "Fin".into(),
+            KeySpec::PageUp => "Pág↑".into(),
+            KeySpec::PageDown => "Pág↓".into(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum Action {
+    Quit,
+    ToggleNav,
+    ToggleHelp,
+    ToggleSelect,
+    Filter,
+    Reload,
+    ApplyAll,
+    ApplySelected,
+    ClearSelection,
+    Delete,
+    SaveConfig,
+    SetCoverArt,
+    ResetColors,
+    TogglePreview,
+    ExtractCover,
+    NextField,
+    PrevField,
+    SaveNext,
+    ClearField,
+    ApplyToAll,
+    ApplyMb,
+    MbPrev,
+    MbNext,
+    MbBrowser,
+    ConfirmYes,
+    ConfirmNo,
+    Down,
+    Up,
+    Left,
+    Right,
+    Home,
+    End,
+    Enter,
+    Escape,
+    Backspace,
+    DeleteChar,
+}
+
+impl Action {
+    fn from_name(s: &str) -> Option<Self> {
+        Some(match s.trim() {
+            "quit" => Action::Quit,
+            "toggle_nav" => Action::ToggleNav,
+            "toggle_help" => Action::ToggleHelp,
+            "toggle_select" => Action::ToggleSelect,
+            "filter" => Action::Filter,
+            "reload" => Action::Reload,
+            "apply_all" => Action::ApplyAll,
+            "apply_selected" => Action::ApplySelected,
+            "clear_selection" => Action::ClearSelection,
+            "delete" => Action::Delete,
+            "save_config" => Action::SaveConfig,
+            "set_cover_art" => Action::SetCoverArt,
+            "reset_colors" => Action::ResetColors,
+            "toggle_preview" => Action::TogglePreview,
+            "extract_cover" => Action::ExtractCover,
+            "next_field" => Action::NextField,
+            "prev_field" => Action::PrevField,
+            "save_next" => Action::SaveNext,
+            "clear_field" => Action::ClearField,
+            "apply_to_all" => Action::ApplyToAll,
+            "apply_mb" => Action::ApplyMb,
+            "mb_prev" => Action::MbPrev,
+            "mb_next" => Action::MbNext,
+            "mb_browser" => Action::MbBrowser,
+            "confirm_yes" => Action::ConfirmYes,
+            "confirm_no" => Action::ConfirmNo,
+            "down" => Action::Down,
+            "up" => Action::Up,
+            "left" => Action::Left,
+            "right" => Action::Right,
+            "home" => Action::Home,
+            "end" => Action::End,
+            "enter" => Action::Enter,
+            "escape" => Action::Escape,
+            "backspace" => Action::Backspace,
+            "delete_char" => Action::DeleteChar,
+            _ => return None,
+        })
+    }
+}
+
+fn preset_browse(nav: NavScheme) -> Vec<(Action, Vec<KeySpec>)> {
+    let ks = |s: &str| KeySpec::parse(s).unwrap();
+    let vim = nav == NavScheme::Vim;
+    vec![
+        (Action::Quit, vec![ks("q"), ks("Q")]),
+        (Action::ToggleNav, vec![ks("N")]),
+        (Action::ToggleHelp, vec![ks(if vim { "/" } else { "h" })]),
+        (Action::ToggleSelect, vec![ks("a"), ks("space")]),
+        (
+            Action::Filter,
+            if vim {
+                vec![ks("f")]
+            } else {
+                vec![ks("f"), ks("/")]
+            },
+        ),
+        (Action::Reload, vec![ks("r")]),
+        (Action::ApplyAll, vec![ks("A")]),
+        (Action::ApplySelected, vec![ks("V"), ks("v")]),
+        (Action::ClearSelection, vec![ks("d")]),
+        (Action::Delete, vec![ks("x"), ks("delete")]),
+        (Action::SaveConfig, vec![ks("C")]),
+        (Action::SetCoverArt, vec![ks("c")]),
+        (Action::ResetColors, vec![ks("R")]),
+        (Action::TogglePreview, vec![ks("P")]),
+        (Action::ExtractCover, vec![ks("e")]),
+        (Action::Down, vec![ks(if vim { "j" } else { "down" })]),
+        (Action::Up, vec![ks(if vim { "k" } else { "up" })]),
+        (Action::Left, vec![ks(if vim { "h" } else { "left" })]),
+        (Action::Right, vec![ks(if vim { "l" } else { "right" })]),
+        (Action::Home, vec![ks(if vim { "g" } else { "home" })]),
+        (Action::End, vec![ks(if vim { "G" } else { "end" })]),
+        (Action::Enter, vec![ks("enter")]),
+        (Action::Escape, vec![ks("esc")]),
+    ]
+}
+
+fn preset_text() -> Vec<(Action, Vec<KeySpec>)> {
+    let ks = |s: &str| KeySpec::parse(s).unwrap();
+    vec![
+        (Action::NextField, vec![ks("tab")]),
+        (Action::PrevField, vec![ks("backtab")]),
+        (Action::SaveNext, vec![ks("ctrl+s")]),
+        (Action::ClearField, vec![ks("ctrl+u")]),
+        (Action::ApplyToAll, vec![ks("ctrl+c")]),
+        (Action::ApplyMb, vec![ks("ctrl+g")]),
+        (Action::MbPrev, vec![ks("pageup")]),
+        (Action::MbNext, vec![ks("pagedown")]),
+        (Action::MbBrowser, vec![ks("ctrl+o")]),
+        (Action::ConfirmYes, vec![ks("y"), ks("Y")]),
+        (Action::ConfirmNo, vec![ks("n"), ks("N")]),
+        (Action::Down, vec![ks("down")]),
+        (Action::Up, vec![ks("up")]),
+        (Action::Left, vec![ks("left")]),
+        (Action::Right, vec![ks("right")]),
+        (Action::Home, vec![ks("home")]),
+        (Action::End, vec![ks("end")]),
+        (Action::Enter, vec![ks("enter")]),
+        (Action::Escape, vec![ks("esc")]),
+        (Action::Backspace, vec![ks("backspace")]),
+        (Action::DeleteChar, vec![ks("delete")]),
+    ]
+}
+
+struct Keymap {
+    browse: HashMap<Action, Vec<KeySpec>>,
+    text: HashMap<Action, Vec<KeySpec>>,
+}
+
+impl Keymap {
+    fn new(nav: NavScheme, custom: &HashMap<Action, Vec<KeySpec>>) -> Self {
+        let mut browse: HashMap<Action, Vec<KeySpec>> = preset_browse(nav).into_iter().collect();
+        let mut text: HashMap<Action, Vec<KeySpec>> = preset_text().into_iter().collect();
+        for (action, keys) in custom {
+            browse.insert(*action, keys.clone());
+            text.insert(*action, keys.clone());
+        }
+        Keymap { browse, text }
+    }
+
+    fn action(&self, key: &KeyEvent, is_text: bool) -> Option<Action> {
+        let map = if is_text { &self.text } else { &self.browse };
+        for (action, keys) in map {
+            if keys.iter().any(|k| k.matches(key)) {
+                return Some(*action);
+            }
+        }
+        None
+    }
+
+    fn keys_for(&self, action: Action, is_text: bool) -> &[KeySpec] {
+        let map = if is_text { &self.text } else { &self.browse };
+        map.get(&action).map(|v| v.as_slice()).unwrap_or(&[])
+    }
+}
+
 struct App {
     current_dir: PathBuf,
     dir_entries: Vec<PathBuf>,
@@ -709,6 +1350,7 @@ struct App {
     current_idx: usize,
     scroll_offset: usize,
     mode: AppMode,
+    nav: NavScheme,
     edit_idx: usize,
     edit_vals: Vec<String>,
     edit_cursor: usize,
@@ -720,23 +1362,39 @@ struct App {
     delete_indices: Vec<usize>,
     cover_path: String,
     cover_cursor: usize,
+    show_help: bool,
     show_preview: bool,
     status_msg: String,
     status_is_error: bool,
     should_quit: bool,
     l: L,
     colors: ColorScheme,
+    config_colors: ColorScheme,
+    keymap: Keymap,
+    custom_keys: HashMap<Action, Vec<KeySpec>>,
+    border_default: BorderStyle,
+    border_overrides: HashMap<String, BorderStyle>,
+    last_config_content: String,
+    last_written_config: String,
     picker: Option<Picker>,
     cover_protocol: Option<StatefulProtocol>,
+    cover_protocol_file: Option<PathBuf>,
+    cover_cache: HashMap<PathBuf, StatefulProtocol>,
+    local_cover_rx: Option<(PathBuf, mpsc::Receiver<(PathBuf, Option<image::DynamicImage>)>)>,
     mb_state: MbState,
     mb_rx: Option<mpsc::Receiver<MbState>>,
     cover_rx: Option<mpsc::Receiver<CoverState>>,
     detail_rx: Option<mpsc::Receiver<MbSuggestion>>,
     mb_cover_protocol: Option<StatefulProtocol>,
+    last_area: Rect,
+    last_click: Option<(std::time::Instant, u16, u16)>,
 }
 
 impl App {
-    fn new(start_dir: PathBuf, l: L, show_preview: bool) -> Self {
+    fn new(start_dir: PathBuf, l: L, config: Config) -> Self {
+        let custom_keys = config.custom_keys;
+        let keymap = Keymap::new(config.nav, &custom_keys);
+        let startup_config = fs::read_to_string(config_path()).unwrap_or_default();
         let mut app = App {
             current_dir: start_dir,
             dir_entries: Vec::new(),
@@ -744,6 +1402,7 @@ impl App {
             current_idx: 0,
             scroll_offset: 0,
             mode: AppMode::Browse,
+            nav: config.nav,
             edit_idx: 0,
             edit_vals: Vec::new(),
             edit_cursor: 0,
@@ -755,19 +1414,32 @@ impl App {
             delete_indices: Vec::new(),
             cover_path: String::new(),
             cover_cursor: 0,
-            show_preview,
+            show_help: true,
+            show_preview: config.show_preview,
             status_msg: String::new(),
             status_is_error: false,
             should_quit: false,
             l,
-            colors: ColorScheme::default(),
+            colors: config.colors.clone(),
+            config_colors: config.colors,
+            keymap,
+            custom_keys,
+            border_default: config.border,
+            border_overrides: config.border_overrides,
+            last_config_content: startup_config.clone(),
+            last_written_config: startup_config,
             picker: None,
             cover_protocol: None,
+            cover_protocol_file: None,
+            cover_cache: HashMap::new(),
+            local_cover_rx: None,
             mb_state: MbState::Idle,
             mb_rx: None,
             cover_rx: None,
             detail_rx: None,
             mb_cover_protocol: None,
+            last_area: Rect::new(0, 0, 0, 0),
+            last_click: None,
         };
         app.load_dir();
         app
@@ -824,41 +1496,85 @@ impl App {
         self.update_cover_state();
     }
 
-    fn update_cover_state(&mut self) {
-        self.cover_protocol = None;
-        let picker = match &self.picker {
-            Some(p) => p,
-            None => return,
-        };
+    fn current_cover_file(&self) -> Option<PathBuf> {
         if self.current_idx < self.dir_entries.len() {
-            return;
+            return None;
         }
         let fidx = self.current_idx - self.dir_entries.len();
-        if fidx >= self.files.len() {
+        self.files.get(fidx).cloned()
+    }
+
+    fn update_cover_state(&mut self) {
+        let Some(fp) = self.current_cover_file() else {
+            self.cover_protocol = None;
+            self.cover_protocol_file = None;
+            return;
+        };
+
+        // already showing this file's cover
+        if self.cover_protocol_file.as_ref() == Some(&fp) {
             return;
         }
-        let filepath = &self.files[fidx];
-        let tagged_file = match read_from_path(filepath) {
-            Ok(f) => f,
-            Err(_) => return,
-        };
-        let tag = match tagged_file.primary_tag().or_else(|| tagged_file.first_tag()) {
-            Some(t) => t,
-            None => return,
-        };
-        let picture = match tag.pictures().first() {
-            Some(p) => p,
-            None => return,
-        };
-        let data = picture.data().to_vec();
-        if data.is_empty() {
+
+        // stash the currently displayed protocol back into the cache
+        if let Some(pf) = self.cover_protocol_file.take() {
+            if let Some(p) = self.cover_protocol.take() {
+                if self.cover_cache.len() >= 48 {
+                    if let Some(oldest) = self.cover_cache.keys().next().cloned() {
+                        self.cover_cache.remove(&oldest);
+                    }
+                }
+                self.cover_cache.insert(pf, p);
+            }
+        }
+
+        // cache hit: reuse cached protocol (no re-read, no re-encode)
+        if let Some(p) = self.cover_cache.remove(&fp) {
+            self.cover_protocol = Some(p);
+            self.cover_protocol_file = Some(fp);
             return;
         }
-        let img = match image::load_from_memory(&data) {
-            Ok(i) => i,
-            Err(_) => return,
-        };
-        self.cover_protocol = Some(picker.new_resize_protocol(img));
+
+        // no cached protocol: read + decode in a background thread
+        // (skip if we already have a pending request for this same file)
+        if let Some((pending, _)) = &self.local_cover_rx {
+            if pending == &fp {
+                return;
+            }
+        }
+        self.cover_protocol = None;
+        self.cover_protocol_file = None;
+        let (tx, rx) = mpsc::channel();
+        self.local_cover_rx = Some((fp.clone(), rx));
+        thread::spawn(move || {
+            let img = decode_cover_image(&fp);
+            let _ = tx.send((fp, img));
+        });
+    }
+
+    fn check_local_cover(&mut self) {
+        if let Some((_, rx)) = &self.local_cover_rx {
+            if let Ok((path, img)) = rx.try_recv() {
+                self.local_cover_rx = None;
+                if let Some(img) = img {
+                    if let Some(picker) = &self.picker {
+                        let protocol = picker.new_resize_protocol(img);
+                        let is_current = self.current_cover_file().as_ref() == Some(&path);
+                        if is_current && self.cover_protocol.is_none() {
+                            self.cover_protocol = Some(protocol);
+                            self.cover_protocol_file = Some(path);
+                        } else {
+                            if self.cover_cache.len() >= 48 {
+                                if let Some(oldest) = self.cover_cache.keys().next().cloned() {
+                                    self.cover_cache.remove(&oldest);
+                                }
+                            }
+                            self.cover_cache.insert(path, protocol);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn check_mb_results(&mut self) {
@@ -952,7 +1668,7 @@ impl App {
                 Some(vals) => {
                     self.edit_vals = vals;
                     self.edit_idx = 0;
-                    self.edit_cursor = self.edit_vals[0].len();
+                    self.edit_cursor = self.edit_vals[0].chars().count();
                     self.mode = AppMode::Edit;
                     self.status_msg.clear();
                     self.query_mb();
@@ -979,7 +1695,7 @@ impl App {
                 Some(vals) => {
                     self.edit_vals = vals;
                     self.edit_idx = 0;
-                    self.edit_cursor = self.edit_vals[0].len();
+                    self.edit_cursor = self.edit_vals[0].chars().count();
                     self.mode = AppMode::Edit;
                     self.status_msg.clear();
                     self.query_mb();
@@ -1160,6 +1876,46 @@ impl App {
         }
     }
 
+    fn open_mb_browser(&mut self) {
+        let (title, artist, album) = match &self.mb_state {
+            MbState::Suggestions { results, index, .. } => {
+                if results.is_empty() {
+                    return;
+                }
+                let s = &results[*index];
+                (s.title.clone(), s.artist.clone(), s.album.clone())
+            }
+            _ => return,
+        };
+        let mut parts: Vec<String> = Vec::new();
+        if !title.is_empty() {
+            parts.push(title);
+        }
+        if !artist.is_empty() {
+            parts.push(artist);
+        }
+        if !album.is_empty() {
+            parts.push(album);
+        }
+        if parts.is_empty() {
+            return;
+        }
+        let url = format!(
+            "https://musicbrainz.org/search?query={}&type=release",
+            url_encode(&parts.join(" ")),
+        );
+        match spawn_in_new_terminal(&url) {
+            Ok(_) => {
+                self.status_msg = format!("{} Abierto en el navegador", icon::GLOBE);
+                self.status_is_error = false;
+            }
+            Err(e) => {
+                self.status_msg = format!("{} No se pudo abrir: {}", icon::CLOSE, e);
+                self.status_is_error = true;
+            }
+        }
+    }
+
     fn apply_mb_suggestion(&mut self) {
         if let MbState::Suggestions { results, index, .. } = &self.mb_state {
             if results.is_empty() {
@@ -1286,6 +2042,16 @@ impl App {
         }
     }
 
+    fn toggle_help(&mut self) {
+        self.show_help = !self.show_help;
+        self.status_msg = if self.show_help {
+            self.l.help_shown()
+        } else {
+            self.l.help_hidden()
+        };
+        self.status_is_error = false;
+    }
+
     fn toggle_select(&mut self) {
         if self.current_idx < self.dir_entries.len() {
             return;
@@ -1403,6 +2169,9 @@ impl App {
         }
 
         if successes > 0 && errors == 0 {
+            self.cover_protocol = None;
+            self.cover_protocol_file = None;
+            self.cover_cache.clear();
             if indices.len() > 1 {
                 self.status_msg = match self.l.lang {
                     Lang::Es => format!("{} Portada asignada a {} archivos", icon::CHECK, successes),
@@ -1450,71 +2219,352 @@ impl App {
         }
     }
 
+    fn content_area(&self) -> Rect {
+        Rect {
+            x: 0,
+            y: 3,
+            width: self.last_area.width,
+            height: self.last_area.height.saturating_sub(5),
+        }
+    }
+
+    fn border_for(&self, widget: &str) -> BorderStyle {
+        self.border_overrides
+            .get(widget)
+            .copied()
+            .unwrap_or(self.border_default)
+    }
+
+    fn block(&self, widget: &str, color: Color) -> Block<'static> {
+        let style = self.border_for(widget);
+        let mut b = Block::default()
+            .borders(if style == BorderStyle::None {
+                Borders::NONE
+            } else {
+                Borders::ALL
+            })
+            .border_style(Style::default().fg(color));
+        if style != BorderStyle::None {
+            b = b.border_type(style.border_type());
+        }
+        b
+    }
+
+    fn reload_config_if_changed(&mut self) {
+        let Ok(content) = fs::read_to_string(config_path()) else {
+            return;
+        };
+        if content == self.last_config_content {
+            return;
+        }
+        self.last_config_content = content.clone();
+        let cfg = load_config();
+        self.colors = cfg.colors.clone();
+        self.config_colors = cfg.colors;
+        self.border_default = cfg.border;
+        self.border_overrides = cfg.border_overrides;
+        self.custom_keys = cfg.custom_keys;
+        self.nav = cfg.nav;
+        self.keymap = Keymap::new(self.nav, &self.custom_keys);
+        self.show_preview = cfg.show_preview;
+        if content != self.last_written_config {
+            self.status_msg = self.l.config_reloaded();
+            self.status_is_error = false;
+        }
+    }
+
+    fn handle_mouse(&mut self, m: MouseEvent) {
+        match self.mode {
+            AppMode::Browse => self.handle_browse_mouse(m),
+            AppMode::Edit => self.handle_edit_mouse(m),
+            AppMode::Filter => self.handle_filter_mouse(m),
+            AppMode::DeleteConfirm => self.handle_delete_mouse(m),
+            AppMode::SetCoverArt => self.handle_cover_mouse(m),
+        }
+    }
+
+    fn handle_browse_mouse(&mut self, m: MouseEvent) {
+        let MouseEvent { kind, column, row, .. } = m;
+        let content = self.content_area();
+        match kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if row >= content.y && row < content.y + content.height {
+                    let now = std::time::Instant::now();
+                    let is_double = match self.last_click {
+                        Some((t, c, r)) => {
+                            c == column
+                                && r == row
+                                && now.duration_since(t).as_millis() < 500
+                        }
+                        None => false,
+                    };
+                    self.last_click = Some((now, column, row));
+                    if is_double {
+                        self.open_item();
+                        return;
+                    }
+                    let visible = (row - content.y) as usize;
+                    let list_height = content.height as usize;
+                    let mut adjusted = self.scroll_offset;
+                    if self.current_idx >= adjusted + list_height {
+                        adjusted = self.current_idx.saturating_sub(list_height - 1);
+                    }
+                    if self.current_idx < adjusted {
+                        adjusted = self.current_idx;
+                    }
+                    let idx = adjusted + visible;
+                    if idx < self.total_items() {
+                        self.current_idx = idx;
+                        self.update_cover_state();
+                    }
+                }
+            }
+            MouseEventKind::Down(MouseButton::Right) => {
+                if row >= content.y && row < content.y + content.height {
+                    let visible = (row - content.y) as usize;
+                    let list_height = content.height as usize;
+                    let mut adjusted = self.scroll_offset;
+                    if self.current_idx >= adjusted + list_height {
+                        adjusted = self.current_idx.saturating_sub(list_height - 1);
+                    }
+                    if self.current_idx < adjusted {
+                        adjusted = self.current_idx;
+                    }
+                    let idx = adjusted + visible;
+                    if idx < self.total_items() {
+                        self.current_idx = idx;
+                        self.update_cover_state();
+                        self.toggle_select();
+                    }
+                }
+            }
+            MouseEventKind::ScrollDown => {
+                if self.current_idx < self.total_items().saturating_sub(1) {
+                    self.current_idx += 1;
+                    self.update_cover_state();
+                }
+            }
+            MouseEventKind::ScrollUp => {
+                if self.current_idx > 0 {
+                    self.current_idx -= 1;
+                    self.update_cover_state();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_edit_mouse(&mut self, m: MouseEvent) {
+        let MouseEvent { kind, column, row, .. } = m;
+        let field_count = self.get_fields().len();
+        match kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if row >= 3 && row < 3 + field_count as u16 {
+                    let f = (row - 3) as usize;
+                    if f < field_count {
+                        self.edit_idx = f;
+                        let val = &self.edit_vals[f];
+                        let char_idx = column.saturating_sub(26) as usize;
+                        let char_idx = char_idx.min(val.chars().count());
+                        self.edit_cursor = val
+                            .char_indices()
+                            .nth(char_idx)
+                            .map(|(i, _)| i)
+                            .unwrap_or(val.len());
+                    }
+                }
+            }
+            MouseEventKind::ScrollDown => {
+                if self.edit_idx < field_count - 1 {
+                    self.edit_idx += 1;
+                    self.edit_cursor = self.edit_vals[self.edit_idx].chars().count();
+                }
+            }
+            MouseEventKind::ScrollUp => {
+                if self.edit_idx > 0 {
+                    self.edit_idx -= 1;
+                    self.edit_cursor = self.edit_vals[self.edit_idx].chars().count();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_filter_mouse(&mut self, m: MouseEvent) {
+        let MouseEvent { kind, column, row, .. } = m;
+        match kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                let area = self.last_area;
+                let popup_width = 50.min(area.width.saturating_sub(4));
+                let popup_height = 3;
+                let x = area.width.saturating_sub(popup_width) / 2;
+                let y = area.height.saturating_sub(popup_height) / 2;
+                let inner = Rect::new(x + 1, y + 1, popup_width.saturating_sub(2), 1);
+                if row >= inner.y && row <= inner.y && column >= inner.x {
+                    let char_idx = (column - inner.x).saturating_sub(2) as usize;
+                    let char_idx = char_idx.min(self.filter_text.chars().count());
+                    self.filter_cursor = self
+                        .filter_text
+                        .char_indices()
+                        .nth(char_idx)
+                        .map(|(i, _)| i)
+                        .unwrap_or(self.filter_text.len());
+                } else {
+                    self.mode = AppMode::Browse;
+                    self.status_msg = self.l.cancelled();
+                    self.status_is_error = false;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_delete_mouse(&mut self, m: MouseEvent) {
+        let MouseEvent { kind, column, row, .. } = m;
+        if let MouseEventKind::Down(MouseButton::Left) = kind {
+            let area = self.last_area;
+            let count = self.delete_indices.len();
+            let filename = if count == 1 {
+                self.get_item(self.delete_indices[0])
+                    .map(|(p, _)| {
+                        p.file_name().unwrap_or_default().to_string_lossy().to_string()
+                    })
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+            let msg = if count == 1 {
+                self.l.confirm_delete_one(&filename)
+            } else {
+                self.l.confirm_delete_many(count)
+            };
+            let popup_width = (msg.len() as u16 + 6).min(area.width.saturating_sub(2));
+            let popup_height = 3;
+            let x = area.width.saturating_sub(popup_width) / 2;
+            let y = area.height.saturating_sub(popup_height) / 2;
+            let popup = Rect::new(x, y, popup_width, popup_height);
+            if !(column >= popup.x
+                && column < popup.x + popup.width
+                && row >= popup.y
+                && row < popup.y + popup.height)
+            {
+                self.mode = AppMode::Browse;
+                self.status_msg = self.l.cancelled();
+                self.status_is_error = false;
+            }
+        }
+    }
+
+    fn handle_cover_mouse(&mut self, m: MouseEvent) {
+        let MouseEvent { kind, column, row, .. } = m;
+        if let MouseEventKind::Down(MouseButton::Left) = kind {
+            let area = self.last_area;
+            let popup_width = 60.min(area.width.saturating_sub(4));
+            let popup_height = 5;
+            let x = area.width.saturating_sub(popup_width) / 2;
+            let y = area.height.saturating_sub(popup_height) / 2;
+            let popup = Rect::new(x, y, popup_width, popup_height);
+            let inner = Rect::new(x + 1, y + 1, popup_width.saturating_sub(2), popup_height.saturating_sub(2));
+            if column >= inner.x
+                && column < inner.x + inner.width
+                && row >= inner.y
+                && row < inner.y + 1
+            {
+                let char_idx = (column - inner.x) as usize;
+                let char_idx = char_idx.min(self.cover_char_count());
+                self.cover_cursor = char_idx;
+            } else if !(column >= popup.x
+                && column < popup.x + popup.width
+                && row >= popup.y
+                && row < popup.y + popup.height)
+            {
+                self.mode = AppMode::Browse;
+                self.status_msg = self.l.cancelled();
+                self.status_is_error = false;
+            }
+        }
+    }
+
     fn handle_browse_key(&mut self, key: KeyEvent) {
         let total = self.total_items();
 
-        match key.code {
-            KeyCode::Char('q') | KeyCode::Char('Q') => {
+        match self.keymap.action(&key, false) {
+            Some(Action::Quit) => {
                 self.should_quit = true;
             }
-            KeyCode::Char('j') | KeyCode::Down => {
+            Some(Action::ToggleNav) => {
+                self.nav = match self.nav {
+                    NavScheme::Vim => NavScheme::Arrows,
+                    NavScheme::Arrows => NavScheme::Vim,
+                };
+                self.keymap = Keymap::new(self.nav, &self.custom_keys);
+                if let Ok(c) = save_config(&self.current_dir, self.show_preview, self.nav) {
+                    self.last_written_config = c;
+                }
+                self.status_msg = if self.nav == NavScheme::Vim {
+                    self.l.nav_vim()
+                } else {
+                    self.l.nav_arrows()
+                };
+                self.status_is_error = false;
+            }
+            Some(Action::ToggleHelp) => self.toggle_help(),
+            Some(Action::Down) => {
                 if self.current_idx < total.saturating_sub(1) {
                     self.current_idx += 1;
                 }
             }
-            KeyCode::Char('k') | KeyCode::Up => {
+            Some(Action::Up) => {
                 if self.current_idx > 0 {
                     self.current_idx -= 1;
                 }
             }
-            KeyCode::Char('h') | KeyCode::Left => {
+            Some(Action::Left) | Some(Action::Escape) => {
                 self.go_parent();
             }
-            KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter => {
+            Some(Action::Right) | Some(Action::Enter) => {
                 self.open_item();
             }
-            KeyCode::Esc => {
-                self.go_parent();
-            }
-            KeyCode::Char('g') | KeyCode::Home => {
+            Some(Action::Home) => {
                 self.current_idx = 0;
             }
-            KeyCode::Char('G') | KeyCode::End => {
+            Some(Action::End) => {
                 self.current_idx = total.saturating_sub(1);
             }
-            KeyCode::Char('a') | KeyCode::Char(' ') => {
+            Some(Action::ToggleSelect) => {
                 self.toggle_select();
             }
-            KeyCode::Char('f') | KeyCode::Char('/') => {
+            Some(Action::Filter) => {
                 self.filter_text.clear();
                 self.filter_cursor = 0;
                 self.mode = AppMode::Filter;
             }
-            KeyCode::Char('r') => {
+            Some(Action::Reload) => {
                 self.load_dir();
                 self.status_msg = self.l.status_reloaded();
                 self.status_is_error = false;
             }
-            KeyCode::Char('A') => {
+            Some(Action::ApplyAll) => {
                 self.enter_edit_mode(true);
             }
-            KeyCode::Char('V') | KeyCode::Char('v') => {
+            Some(Action::ApplySelected) => {
                 self.select_all();
                 let count = self.selected.len();
                 self.status_msg = self.l.status_selected_all(count);
                 self.status_is_error = false;
             }
-            KeyCode::Char('d') => {
+            Some(Action::ClearSelection) => {
                 self.selected.clear();
                 self.status_msg = self.l.status_selection_cleared();
                 self.status_is_error = false;
             }
-            KeyCode::Char('x') | KeyCode::Delete => {
+            Some(Action::Delete) => {
                 self.enter_delete_confirm();
             }
-            KeyCode::Char('C') => {
-                match save_config(&self.current_dir, self.show_preview) {
-                    Ok(()) => {
+            Some(Action::SaveConfig) => {
+                match save_config(&self.current_dir, self.show_preview, self.nav) {
+                    Ok(content) => {
+                        self.last_written_config = content;
                         self.status_msg = self.l.config_saved();
                         self.status_is_error = false;
                     }
@@ -1524,15 +2574,15 @@ impl App {
                     }
                 }
             }
-            KeyCode::Char('c') => {
+            Some(Action::SetCoverArt) => {
                 self.enter_set_cover_art();
             }
-            KeyCode::Char('R') => {
-                self.colors = ColorScheme::default();
+            Some(Action::ResetColors) => {
+                self.colors = self.config_colors.clone();
                 self.status_msg = self.l.reload_colors();
                 self.status_is_error = false;
             }
-            KeyCode::Char('P') => {
+            Some(Action::TogglePreview) => {
                 self.show_preview = !self.show_preview;
                 self.status_msg = if self.show_preview {
                     self.l.preview_enabled()
@@ -1541,7 +2591,7 @@ impl App {
                 };
                 self.status_is_error = false;
             }
-            KeyCode::Char('e') => {
+            Some(Action::ExtractCover) => {
                 if self.current_idx < self.dir_entries.len() {
                     // directory, skip
                 } else {
@@ -1565,17 +2615,29 @@ impl App {
         self.update_cover_state();
     }
 
+    fn edit_byte_pos(&self) -> usize {
+        let val = &self.edit_vals[self.edit_idx];
+        val.char_indices()
+            .nth(self.edit_cursor)
+            .map(|(i, _)| i)
+            .unwrap_or(val.len())
+    }
+
+    fn edit_char_count(&self) -> usize {
+        self.edit_vals[self.edit_idx].chars().count()
+    }
+
     fn handle_edit_key(&mut self, key: KeyEvent) {
         let field_count = self.get_fields().len();
 
-        match key.code {
-            KeyCode::Esc => {
+        match self.keymap.action(&key, true) {
+            Some(Action::Escape) => {
                 self.mode = AppMode::Browse;
                 self.batch_mode = false;
                 self.batch_indices.clear();
                 self.status_msg.clear();
             }
-            KeyCode::Enter => {
+            Some(Action::Enter) => {
                 self.save_current();
                 if self.batch_mode {
                     self.batch_mode = false;
@@ -1584,143 +2646,161 @@ impl App {
                 }
                 self.mode = AppMode::Browse;
             }
-            KeyCode::Tab => {
+            Some(Action::NextField) => {
                 self.edit_idx = (self.edit_idx + 1) % field_count;
-                self.edit_cursor = self.edit_vals[self.edit_idx].len();
+                self.edit_cursor = self.edit_vals[self.edit_idx].chars().count();
             }
-            KeyCode::BackTab => {
+            Some(Action::PrevField) => {
                 if self.edit_idx == 0 {
                     self.edit_idx = field_count - 1;
                 } else {
                     self.edit_idx -= 1;
                 }
-                self.edit_cursor = self.edit_vals[self.edit_idx].len();
+                self.edit_cursor = self.edit_vals[self.edit_idx].chars().count();
             }
-            KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            Some(Action::SaveNext) => {
                 self.save_and_next();
             }
-            KeyCode::Backspace => {
+            Some(Action::Down) => {
+                if self.edit_idx < field_count - 1 {
+                    self.edit_idx += 1;
+                    self.edit_cursor = self.edit_vals[self.edit_idx].chars().count();
+                }
+            }
+            Some(Action::Up) => {
+                if self.edit_idx > 0 {
+                    self.edit_idx -= 1;
+                    self.edit_cursor = self.edit_vals[self.edit_idx].chars().count();
+                }
+            }
+            Some(Action::Backspace) => {
                 if self.edit_cursor > 0 {
                     self.edit_cursor -= 1;
-                    self.edit_vals[self.edit_idx].remove(self.edit_cursor);
+                    let pos = self.edit_byte_pos();
+                    self.edit_vals[self.edit_idx].remove(pos);
                 }
             }
-            KeyCode::Delete => {
-                if self.edit_cursor < self.edit_vals[self.edit_idx].len() {
-                    self.edit_vals[self.edit_idx].remove(self.edit_cursor);
+            Some(Action::DeleteChar) => {
+                if self.edit_cursor < self.edit_char_count() {
+                    let pos = self.edit_byte_pos();
+                    self.edit_vals[self.edit_idx].remove(pos);
                 }
             }
-            KeyCode::Left => {
+            Some(Action::Left) => {
                 if self.edit_cursor > 0 {
                     self.edit_cursor -= 1;
                 }
             }
-            KeyCode::Right => {
-                if self.edit_cursor < self.edit_vals[self.edit_idx].len() {
+            Some(Action::Right) => {
+                if self.edit_cursor < self.edit_char_count() {
                     self.edit_cursor += 1;
                 }
             }
-            KeyCode::Up => {
-                if self.edit_idx > 0 {
-                    self.edit_idx -= 1;
-                    self.edit_cursor = self.edit_vals[self.edit_idx].len();
-                }
-            }
-            KeyCode::Down => {
-                if self.edit_idx < field_count - 1 {
-                    self.edit_idx += 1;
-                    self.edit_cursor = self.edit_vals[self.edit_idx].len();
-                }
-            }
-            KeyCode::Home => {
+            Some(Action::Home) => {
                 self.edit_cursor = 0;
             }
-            KeyCode::End => {
-                self.edit_cursor = self.edit_vals[self.edit_idx].len();
+            Some(Action::End) => {
+                self.edit_cursor = self.edit_vals[self.edit_idx].chars().count();
             }
-            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            Some(Action::ClearField) => {
                 self.edit_vals[self.edit_idx].clear();
                 self.edit_cursor = 0;
             }
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            Some(Action::ApplyToAll) => {
                 self.enter_edit_mode(true);
             }
-            KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            Some(Action::ApplyMb) => {
                 self.apply_mb_suggestion();
             }
-            KeyCode::PageDown => self.navigate_mb(1),
-            KeyCode::PageUp => self.navigate_mb(-1),
-            KeyCode::Char(c) => {
-                self.edit_vals[self.edit_idx].insert(self.edit_cursor, c);
-                self.edit_cursor += 1;
+            Some(Action::MbPrev) => self.navigate_mb(-1),
+            Some(Action::MbNext) => self.navigate_mb(1),
+            Some(Action::MbBrowser) => {
+                self.open_mb_browser();
             }
-            _ => {}
+            _ => {
+                if let KeyCode::Char(c) = key.code {
+                    let pos = self.edit_byte_pos();
+                    self.edit_vals[self.edit_idx].insert(pos, c);
+                    self.edit_cursor += 1;
+                }
+            }
         }
     }
 
     fn handle_filter_key(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Esc => {
+        match self.keymap.action(&key, true) {
+            Some(Action::Escape) => {
                 self.mode = AppMode::Browse;
                 self.filter_text.clear();
                 self.load_dir();
             }
-            KeyCode::Enter => {
+            Some(Action::Enter) => {
                 self.mode = AppMode::Browse;
                 self.load_dir();
                 self.current_idx = 0;
                 self.scroll_offset = 0;
             }
-            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            Some(Action::ClearField) => {
                 self.filter_text.clear();
                 self.filter_cursor = 0;
                 self.load_dir();
                 self.current_idx = 0;
                 self.scroll_offset = 0;
             }
-            KeyCode::Backspace => {
+            Some(Action::Backspace) => {
                 if self.filter_cursor > 0 {
                     self.filter_cursor -= 1;
-                    self.filter_text.remove(self.filter_cursor);
+                    let pos = self.filter_text
+                        .char_indices()
+                        .nth(self.filter_cursor)
+                        .map(|(i, _)| i)
+                        .unwrap_or(0);
+                    self.filter_text.remove(pos);
                 }
                 self.load_dir();
                 self.current_idx = 0;
                 self.scroll_offset = 0;
             }
-            KeyCode::Left => {
+            Some(Action::Left) => {
                 if self.filter_cursor > 0 {
                     self.filter_cursor -= 1;
                 }
             }
-            KeyCode::Right => {
-                if self.filter_cursor < self.filter_text.len() {
+            Some(Action::Right) => {
+                if self.filter_cursor < self.filter_text.chars().count() {
                     self.filter_cursor += 1;
                 }
             }
-            KeyCode::Home => {
+            Some(Action::Home) => {
                 self.filter_cursor = 0;
             }
-            KeyCode::End => {
-                self.filter_cursor = self.filter_text.len();
+            Some(Action::End) => {
+                self.filter_cursor = self.filter_text.chars().count();
             }
-            KeyCode::Char(c) => {
-                self.filter_text.insert(self.filter_cursor, c);
-                self.filter_cursor += 1;
-                self.load_dir();
-                self.current_idx = 0;
-                self.scroll_offset = 0;
+            _ => {
+                if let KeyCode::Char(c) = key.code {
+                    let pos = self.filter_text
+                        .char_indices()
+                        .nth(self.filter_cursor)
+                        .map(|(i, _)| i)
+                        .unwrap_or(self.filter_text.len());
+                    self.filter_text.insert(pos, c);
+                    self.filter_cursor += 1;
+                    self.load_dir();
+                    self.current_idx = 0;
+                    self.scroll_offset = 0;
+                }
             }
-            _ => {}
         }
     }
 
     fn handle_delete_confirm_key(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+        match self.keymap.action(&key, true) {
+            Some(Action::Enter) | Some(Action::ConfirmYes) => {
                 self.confirm_delete();
                 self.mode = AppMode::Browse;
             }
-            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+            Some(Action::Escape) | Some(Action::ConfirmNo) => {
                 self.mode = AppMode::Browse;
                 self.status_msg = self.l.cancelled();
                 self.status_is_error = false;
@@ -1742,13 +2822,13 @@ impl App {
     }
 
     fn handle_cover_art_key(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Esc => {
+        match self.keymap.action(&key, true) {
+            Some(Action::Escape) => {
                 self.mode = AppMode::Browse;
                 self.status_msg = self.l.cancelled();
                 self.status_is_error = false;
             }
-            KeyCode::Enter => {
+            Some(Action::Enter) => {
                 if self.cover_path.is_empty() {
                     return;
                 }
@@ -1757,43 +2837,55 @@ impl App {
                     self.update_cover_state();
                 }
             }
-            KeyCode::Char(c) => {
-                let byte_pos = self.cover_byte_idx();
-                self.cover_path.insert(byte_pos, c);
-                self.cover_cursor += 1;
-            }
-            KeyCode::Backspace => {
+            Some(Action::Backspace) => {
                 if self.cover_cursor > 0 {
                     self.cover_cursor -= 1;
                     let byte_pos = self.cover_byte_idx();
                     self.cover_path.remove(byte_pos);
                 }
             }
-            KeyCode::Delete => {
+            Some(Action::DeleteChar) => {
                 if self.cover_cursor < self.cover_char_count() {
                     let byte_pos = self.cover_byte_idx();
                     self.cover_path.remove(byte_pos);
                 }
             }
-            KeyCode::Left => {
+            Some(Action::Left) => {
                 if self.cover_cursor > 0 {
                     self.cover_cursor -= 1;
                 }
             }
-            KeyCode::Right => {
+            Some(Action::Right) => {
                 if self.cover_cursor < self.cover_char_count() {
                     self.cover_cursor += 1;
                 }
             }
-            KeyCode::Home => {
+            Some(Action::Home) => {
                 self.cover_cursor = 0;
             }
-            KeyCode::End => {
+            Some(Action::End) => {
                 self.cover_cursor = self.cover_char_count();
             }
-            _ => {}
+            _ => {
+                if let KeyCode::Char(c) = key.code {
+                    let byte_pos = self.cover_byte_idx();
+                    self.cover_path.insert(byte_pos, c);
+                    self.cover_cursor += 1;
+                }
+            }
         }
     }
+}
+
+fn decode_cover_image(filepath: &Path) -> Option<image::DynamicImage> {
+    let tagged_file = read_from_path(filepath).ok()?;
+    let tag = tagged_file.primary_tag().or_else(|| tagged_file.first_tag())?;
+    let picture = tag.pictures().first()?;
+    let data = picture.data();
+    if data.is_empty() {
+        return None;
+    }
+    image::load_from_memory(data).ok()
 }
 
 fn read_metadata(filepath: &Path) -> Option<Vec<String>> {
@@ -1886,6 +2978,66 @@ fn set_cover_art(filepath: &Path, image_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn command_exists(name: &str) -> bool {
+    std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("command -v {} >/dev/null 2>&1", name))
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn spawn_in_new_terminal(url: &str) -> Result<(), String> {
+    use std::process::{Command, Stdio};
+
+    let inner = format!("xdg-open \"{}\"", url);
+    let candidates: &[&[&str]] = &[
+        &["foot", "--", "sh", "-c", inner.as_str()],
+        &["kitty", "--", "sh", "-c", inner.as_str()],
+        &["alacritty", "-e", "sh", "-c", inner.as_str()],
+        &["wezterm", "start", "--", "sh", "-c", inner.as_str()],
+        &["xterm", "-e", "sh", "-c", inner.as_str()],
+    ];
+
+    for args in candidates {
+        if !command_exists(args[0]) {
+            continue;
+        }
+        let mut c = Command::new(args[0]);
+        for a in &args[1..] {
+            c.arg(a);
+        }
+        if c
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .is_ok()
+        {
+            return Ok(());
+        }
+    }
+
+    Command::new("xdg-open")
+        .arg(url)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("{}", e))
+}
+
+fn url_encode(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        match b {
+            b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
+}
+
 fn extract_cover_from(filepath: &Path) -> Result<String, String> {
     use std::fs;
 
@@ -1906,7 +3058,9 @@ fn extract_cover_from(filepath: &Path) -> Result<String, String> {
     let fmt = image::guess_format(data).map_err(|e| format!("Formato: {}", e))?;
     let ext = fmt.extensions_str()[0];
     let stem = filepath.file_stem().unwrap_or_default();
-    let out_path = filepath.with_file_name(format!("{}.{}", stem.to_string_lossy(), ext));
+    let out_dir = covers_dir();
+    fs::create_dir_all(&out_dir).map_err(|e| format!("No se pudo crear la carpeta: {}", e))?;
+    let out_path = out_dir.join(format!("{}.{}", stem.to_string_lossy(), ext));
     fs::write(&out_path, data).map_err(|e| format!("No se pudo escribir: {}", e))?;
     Ok(out_path.to_string_lossy().to_string())
 }
@@ -2038,6 +3192,7 @@ fn query_musicbrainz(title: &str, artist: &str, album: &str) -> MbState {
 }
 
 fn ui(frame: &mut Frame, app: &mut App) {
+    app.last_area = frame.area();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -2085,10 +3240,12 @@ fn render_browse(frame: &mut Frame, app: &mut App, chunks: &[Rect]) {
     let dir_para = Paragraph::new(dir_text).style(dir_style);
     frame.render_widget(dir_para, chunks[2]);
 
-    let help_para = Paragraph::new(app.l.help_browse())
-        .style(Style::default().fg(app.colors.help_text))
-        .alignment(ratatui::layout::Alignment::Center);
-    frame.render_widget(help_para, chunks[1]);
+    if app.show_help {
+        let help_para = Paragraph::new(app.l.help_browse(&app.keymap))
+            .style(Style::default().fg(app.colors.help_text))
+            .alignment(ratatui::layout::Alignment::Center);
+        frame.render_widget(help_para, chunks[1]);
+    }
 
     let (list_area, preview_area) = if app.show_preview {
         let content_chunks = Layout::default()
@@ -2227,10 +3384,12 @@ fn render_edit(frame: &mut Frame, app: &mut App, chunks: &[Rect]) {
     let title = Paragraph::new(title_text).style(title_style);
     frame.render_widget(title, chunks[2]);
 
-    let help_para = Paragraph::new(app.l.help_edit())
-        .style(Style::default().fg(app.colors.help_text))
-        .alignment(ratatui::layout::Alignment::Center);
-    frame.render_widget(help_para, chunks[1]);
+    if app.show_help {
+        let help_para = Paragraph::new(app.l.help_edit(&app.keymap))
+            .style(Style::default().fg(app.colors.help_text))
+            .alignment(ratatui::layout::Alignment::Center);
+        frame.render_widget(help_para, chunks[1]);
+    }
 
     let field_count = app.get_fields().len();
     let form_widget = {
@@ -2353,7 +3512,20 @@ fn render_edit(frame: &mut Frame, app: &mut App, chunks: &[Rect]) {
             } else {
                 source_label.to_string()
             };
-            let nav = format!(" {}/{}  [{}]  Ctrl+G:aplicar", index + 1, results.len(), tag);
+            let mb_label = |a: Action| {
+                app.keymap
+                    .keys_for(a, true)
+                    .first()
+                    .map(|k| k.label())
+                    .unwrap_or_default()
+            };
+            let nav = format!(
+                " {}/{}  [{}]  {}:aplicar",
+                index + 1,
+                results.len(),
+                tag,
+                mb_label(Action::ApplyMb)
+            );
             v.push(Line::from(Span::styled(
                 nav,
                 Style::default().fg(app.colors.metadata_label).add_modifier(Modifier::BOLD),
@@ -2398,6 +3570,13 @@ fn render_edit(frame: &mut Frame, app: &mut App, chunks: &[Rect]) {
                     v.push(Line::from(Span::styled(
                         format!("  {}", e),
                         Style::default().fg(app.colors.error),
+                    )));
+                    v.push(Line::from(Span::styled(
+                        format!(
+                            "  [{}] Buscar en MusicBrainz",
+                            mb_label(Action::MbBrowser)
+                        ),
+                        Style::default().fg(app.colors.metadata_label),
                     )));
                 }
                 _ => {}
@@ -2467,9 +3646,8 @@ fn render_edit(frame: &mut Frame, app: &mut App, chunks: &[Rect]) {
 
 
 fn render_preview(frame: &mut Frame, app: &mut App, area: Rect) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(app.colors.preview_border))
+    let block = app
+        .block("preview", app.colors.preview_border)
         .title(" Preview ");
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -2613,10 +3791,9 @@ fn render_filter_popup(frame: &mut Frame, app: &App) {
 
     let popup_area = Rect::new(x, y, popup_width, popup_height);
 
-    let block = Block::default()
-        .title(app.l.filter_title())
-        .borders(Borders::ALL)
-        .style(Style::default().fg(app.colors.filter_border));
+    let block = app
+        .block("filter", app.colors.filter_border)
+        .title(app.l.filter_title());
 
     let filter_display = format!("> {}_", app.filter_text);
     let filter_para = Paragraph::new(filter_display).style(
@@ -2660,10 +3837,9 @@ fn render_delete_confirm(frame: &mut Frame, app: &App) {
 
     let popup_area = Rect::new(x, y, popup_width, popup_height);
 
-    let block = Block::default()
-        .title(app.l.confirm_delete_title())
-        .borders(Borders::ALL)
-        .style(Style::default().fg(app.colors.delete_border));
+    let block = app
+        .block("delete", app.colors.delete_border)
+        .title(app.l.confirm_delete_title());
 
     let inner = block.inner(popup_area);
     frame.render_widget(block, popup_area);
@@ -2716,10 +3892,7 @@ fn render_cover_art_popup(frame: &mut Frame, app: &App) {
 
     let popup_area = Rect::new(x, y, popup_width, popup_height);
 
-    let block = Block::default()
-        .title(title)
-        .borders(Borders::ALL)
-        .style(Style::default().fg(app.colors.cover_border));
+    let block = app.block("cover", app.colors.cover_border).title(title);
 
     let inner = block.inner(popup_area);
     frame.render_widget(block, popup_area);
@@ -2738,9 +3911,7 @@ fn render_cover_art_popup(frame: &mut Frame, app: &App) {
         app.cover_path.clone()
     };
 
-    let input_block = Block::default()
-        .borders(Borders::ALL)
-        .style(Style::default().fg(app.colors.input_border));
+    let input_block = app.block("input", app.colors.input_border);
 
     let input_area = Rect {
         x: inner.x,
@@ -2776,12 +3947,12 @@ fn render_cover_art_popup(frame: &mut Frame, app: &App) {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let l = L::detect();
 
-    let (config_dir, show_preview) = load_config();
+    let config = load_config();
 
     let start_dir = std::env::args()
         .nth(1)
         .map(PathBuf::from)
-        .or(config_dir)
+        .or(config.dir.clone())
         .unwrap_or_else(|| dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")));
 
     let start_dir = if start_dir.exists() {
@@ -2793,23 +3964,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new(start_dir, l, show_preview);
+    let mut app = App::new(start_dir, l, config);
 
     eprintln!("{}", app.l.lang_detected());
 
     app.picker = Some(Picker::from_query_stdio()?);
     app.update_cover_state();
 
+    let mut last_status_msg = String::new();
+    let mut last_status_change = std::time::Instant::now();
+
     loop {
+        app.check_local_cover();
         app.check_mb_results();
+        app.reload_config_if_changed();
+
+        // expire status messages after a few seconds
+        if app.status_msg != last_status_msg {
+            last_status_msg = app.status_msg.clone();
+            last_status_change = std::time::Instant::now();
+        } else if !app.status_msg.is_empty()
+            && last_status_change.elapsed().as_secs() >= 4
+        {
+            app.status_msg.clear();
+            last_status_msg.clear();
+        }
+
         terminal.draw(|f| ui(f, &mut app))?;
 
-        if let Event::Key(key) = event::read()? {
-            app.handle_key(key);
+        if event::poll(std::time::Duration::from_millis(200))? {
+            match event::read()? {
+                Event::Key(key) => app.handle_key(key),
+                Event::Mouse(mouse) => app.handle_mouse(mouse),
+                _ => {}
+            }
         }
 
         if app.should_quit {
@@ -2818,7 +4010,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
     terminal.show_cursor()?;
 
     Ok(())
