@@ -94,6 +94,47 @@ struct MbReleaseSearchResult {
     artist_credit: Option<Vec<MbArtistCredit>>,
 }
 
+#[derive(Deserialize)]
+struct DeezerSearchResponse {
+    data: Vec<DeezerAlbum>,
+}
+
+#[derive(Deserialize)]
+#[allow(dead_code)]
+struct DeezerAlbum {
+    title: String,
+    #[serde(rename = "cover_xl")]
+    cover_xl: String,
+    artist: DeezerArtist,
+}
+
+#[derive(Deserialize)]
+#[allow(dead_code)]
+struct DeezerArtist {
+    name: String,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CoverSource {
+    Musicbrainz,
+    Deezer,
+}
+
+impl CoverSource {
+    fn parse(s: &str) -> Self {
+        match s.trim().to_lowercase().as_str() {
+            "deezer" => CoverSource::Deezer,
+            _ => CoverSource::Musicbrainz,
+        }
+    }
+}
+
+impl Default for CoverSource {
+    fn default() -> Self {
+        CoverSource::Musicbrainz
+    }
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum MbSource {
     Recording,
@@ -284,6 +325,7 @@ struct Config {
     dir: Option<PathBuf>,
     show_preview: bool,
     nav: NavScheme,
+    cover_source: CoverSource,
     colors: ColorScheme,
     custom_keys: HashMap<Action, Vec<KeySpec>>,
     border: BorderStyle,
@@ -296,6 +338,7 @@ impl Default for Config {
             dir: None,
             show_preview: true,
             nav: NavScheme::default(),
+            cover_source: CoverSource::default(),
             colors: ColorScheme::default(),
             custom_keys: HashMap::new(),
             border: BorderStyle::default(),
@@ -333,6 +376,9 @@ fn load_config() -> Config {
                 }
                 "nav" => {
                     config.nav = NavScheme::parse(value);
+                }
+                "cover_source" => {
+                    config.cover_source = CoverSource::parse(value);
                 }
                 "border" => {
                     config.border = BorderStyle::parse(value);
@@ -1374,6 +1420,7 @@ struct App {
     custom_keys: HashMap<Action, Vec<KeySpec>>,
     border_default: BorderStyle,
     border_overrides: HashMap<String, BorderStyle>,
+    cover_source: CoverSource,
     last_config_content: String,
     last_written_config: String,
     picker: Option<Picker>,
@@ -1426,6 +1473,7 @@ impl App {
             custom_keys,
             border_default: config.border,
             border_overrides: config.border_overrides,
+            cover_source: config.cover_source,
             last_config_content: startup_config.clone(),
             last_written_config: startup_config,
             picker: None,
@@ -1735,32 +1783,23 @@ impl App {
                 return;
             }
             let rid = results[index].release_id.clone();
-            if rid.is_empty() {
+            let title = results[index].title.clone();
+            let artist = results[index].artist.clone();
+            let album = results[index].album.clone();
+            if rid.is_empty() && title.is_empty() && album.is_empty() {
                 *cover_state = CoverState::None;
                 return;
             }
             *cover_state = CoverState::Loading;
             let (tx, rx) = mpsc::channel();
             self.cover_rx = Some(rx);
+            let source = self.cover_source;
             thread::spawn(move || {
-                let url = format!("https://coverartarchive.org/release/{}/front", rid);
-                let config = ureq::Agent::config_builder()
-                    .user_agent("musictag/0.1.0 ( jpablo@example.com )")
-                    .build();
-                let agent = ureq::Agent::new_with_config(config);
-                let resp = match agent.get(&url).call() {
-                    Ok(r) => r,
-                    Err(e) => {
-                        let _ = tx.send(CoverState::Error(format!("Cover download: {}", e)));
-                        return;
-                    }
+                let cover = match source {
+                    CoverSource::Deezer => download_cover_from_deezer(&title, &artist, &album),
+                    CoverSource::Musicbrainz => download_cover_from_musicbrainz(&rid),
                 };
-                let mut reader = resp.into_body().into_reader();
-                let mut buf = Vec::new();
-                match std::io::Read::read_to_end(&mut reader, &mut buf) {
-                    Ok(_) => { let _ = tx.send(CoverState::Loaded(buf)); }
-                    Err(e) => { let _ = tx.send(CoverState::Error(format!("Cover read: {}", e))); }
-                }
+                let _ = tx.send(cover);
             });
         }
     }
@@ -2263,6 +2302,7 @@ impl App {
         self.config_colors = cfg.colors;
         self.border_default = cfg.border;
         self.border_overrides = cfg.border_overrides;
+        self.cover_source = cfg.cover_source;
         self.custom_keys = cfg.custom_keys;
         self.nav = cfg.nav;
         self.keymap = Keymap::new(self.nav, &self.custom_keys);
@@ -3063,6 +3103,96 @@ fn extract_cover_from(filepath: &Path) -> Result<String, String> {
     let out_path = out_dir.join(format!("{}.{}", stem.to_string_lossy(), ext));
     fs::write(&out_path, data).map_err(|e| format!("No se pudo escribir: {}", e))?;
     Ok(out_path.to_string_lossy().to_string())
+}
+
+fn download_cover_from_musicbrainz(release_id: &str) -> CoverState {
+    if release_id.is_empty() {
+        return CoverState::None;
+    }
+    let url = format!("https://coverartarchive.org/release/{}/front", release_id);
+    let config = ureq::Agent::config_builder()
+        .user_agent("musictag/0.1.0 ( jpablo@example.com )")
+        .timeout_global(Some(std::time::Duration::from_secs(10)))
+        .build();
+    let agent = ureq::Agent::new_with_config(config);
+    let resp = match agent.get(&url).call() {
+        Ok(r) => r,
+        Err(e) => {
+            return CoverState::Error(format!("Cover download: {}", e));
+        }
+    };
+    let mut reader = resp.into_body().into_reader();
+    let mut buf = Vec::new();
+    match std::io::Read::read_to_end(&mut reader, &mut buf) {
+        Ok(_) => CoverState::Loaded(buf),
+        Err(e) => CoverState::Error(format!("Cover read: {}", e)),
+    }
+}
+
+fn download_cover_from_deezer(title: &str, artist: &str, album: &str) -> CoverState {
+    let enc = |s: &str| s.replace(' ', "%20").replace('&', "%26");
+
+    let mut parts: Vec<String> = Vec::new();
+    if !album.is_empty() {
+        parts.push(enc(album));
+    }
+    if !artist.is_empty() {
+        parts.push(enc(artist));
+    }
+    if parts.is_empty() && !title.is_empty() {
+        parts.push(enc(title));
+    }
+    if parts.is_empty() {
+        return CoverState::None;
+    }
+    let q = parts.join("%20");
+    let url = format!("https://api.deezer.com/search/album?q={}&limit=5", q);
+    let config = ureq::Agent::config_builder()
+        .user_agent("musictag/0.1.0 ( jpablo@example.com )")
+        .timeout_global(Some(std::time::Duration::from_secs(10)))
+        .build();
+    let agent = ureq::Agent::new_with_config(config);
+    let mut resp = match agent.get(&url).call() {
+        Ok(r) => r,
+        Err(e) => {
+            return CoverState::Error(format!("Deezer search: {}", e));
+        }
+    };
+    let body: String = match resp.body_mut().read_to_string() {
+        Ok(b) => b,
+        Err(e) => {
+            return CoverState::Error(format!("Deezer read: {}", e));
+        }
+    };
+    let search: DeezerSearchResponse = match serde_json::from_str(&body) {
+        Ok(s) => s,
+        Err(e) => {
+            return CoverState::Error(format!("Deezer parse: {}", e));
+        }
+    };
+    let cover_url = search
+        .data
+        .iter()
+        .find(|a| !a.cover_xl.is_empty())
+        .map(|a| a.cover_xl.as_str());
+    let cover_url = match cover_url {
+        Some(u) => u,
+        None => {
+            return CoverState::Error("No cover found on Deezer".into());
+        }
+    };
+    let resp = match agent.get(cover_url).call() {
+        Ok(r) => r,
+        Err(e) => {
+            return CoverState::Error(format!("Deezer cover download: {}", e));
+        }
+    };
+    let mut reader = resp.into_body().into_reader();
+    let mut buf = Vec::new();
+    match std::io::Read::read_to_end(&mut reader, &mut buf) {
+        Ok(_) => CoverState::Loaded(buf),
+        Err(e) => CoverState::Error(format!("Deezer cover read: {}", e)),
+    }
 }
 
 fn query_musicbrainz(title: &str, artist: &str, album: &str) -> MbState {

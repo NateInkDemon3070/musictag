@@ -25,6 +25,7 @@ The config file lives at `~/.config/musictag/config`. It uses a simple `key=valu
 default_dir=/home/you/Music
 show_preview=true
 nav=vim            # vim or arrows
+cover_source=musicbrainz  # musicbrainz or deezer
 
 # Colors — commented by default, uncomment to change
 # color.background=#1e1e2e
